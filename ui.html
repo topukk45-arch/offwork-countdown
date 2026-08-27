@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>下班倒计时</title>
+<style>
+  :root {
+    --accent: #4cc2ff;
+    --display: Bahnschrift, "Segoe UI Variable Display", "Segoe UI", sans-serif;
+    --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+    --body: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  [data-theme=dark] {
+    --fg: rgba(255,255,255,.96); --fg2: rgba(255,255,255,.5);
+    --hair: rgba(255,255,255,.13);
+    --plate: rgba(255,255,255,.07); --plate2: rgba(255,255,255,.13);
+    --shadow: 0 1px 3px rgba(0,0,0,.5);
+    --scrimbg: rgba(12,14,17,.9);
+    --solid: #191c21;
+    --fg3: rgba(255,255,255,.72);
+  }
+  [data-theme=light] {
+    --fg: rgba(16,18,22,.94); --fg2: rgba(16,18,22,.48);
+    --hair: rgba(0,0,0,.11);
+    --plate: rgba(0,0,0,.05); --plate2: rgba(0,0,0,.11);
+    --shadow: 0 1px 2px rgba(255,255,255,.55);
+    --scrimbg: rgba(246,247,249,.92);
+    --solid: #ffffff;
+    --fg3: rgba(16,18,22,.7);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: transparent; overflow: hidden; }
+  body { font-family: var(--body); color: var(--fg); user-select: none; cursor: default;
+         zoom: var(--ui, 1); }
+
+  /* ---------- 玻璃面 ---------- */
+  /* 卡片自己不画任何底色。之前叠了一层高光渐变，跟系统毛玻璃是两套东西，
+     结果左边看着像一块白板贴在玻璃上。底色只由 DWM 提供。 */
+  .widget {
+    position: relative; overflow: hidden;
+    text-shadow: var(--shadow);
+  }
+  /* 纯色模式：底色由 DWM 用 ACCENT_ENABLE_GRADIENT 填，网页这边保持透明。
+     早先用 CSS 画背景 + 关闭系统合成，结果窗口透明链路被切断，露出白块。 */
+  [data-bg=solid] .widget { background: none; text-shadow: none; }
+  [data-bg=solid] .grain { display: none; }
+  /* 图片是整卡背景。原来的"右侧贴片"设定连带产生了一块死区，
+     没图时那半边永远是空的，所以改成铺满。 */
+  .photo { position: absolute; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+  .photo img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: var(--ifit, cover);
+    transform: translate(var(--ix,0px), var(--iy,0px)) scale(var(--iscale,1));
+    opacity: var(--op,1);
+    -webkit-user-drag: none;
+  }
+  /* filter 和 mix-blend-mode 只在真正用到时才挂上。
+     这两个属性会让 Chromium 给整个层级上下文分配一块不透明画布，
+     WebView2 的透明背景就此失效，组件区域会变成死白一片。 */
+  .photo img.fx { filter: var(--fx); }
+  .photo img.bl { mix-blend-mode: var(--blend); }
+  .photo.editing {
+    pointer-events: auto; cursor: move; z-index: 3;
+    outline: 1px dashed var(--accent); outline-offset: -2px;
+  }
+  /* 文字底衬：只在图片铺满整卡时才需要，用来保住文字可读性。
+     右侧贴片模式和无图时都不显示，否则会在玻璃上糊一层灰。 */
+  .scrim {
+    display: none;
+    position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    background: var(--scrimbg); opacity: var(--scrimo, .55);
+  }
+  [data-img=full] .scrim { display: block; }
+  /* Win10 的 Acrylic 不带颗粒，纯色块看着发假，补一层静态噪点 */
+  .grain {
+    position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    opacity: var(--grain, .05);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  /* ---------- 两列：左边还有多久，右边挣了多少 ---------- */
+  /* 默认：左右两列，没有图片时铺满整卡不浪费空间 */
+  .body { position: relative; z-index: 2; padding: 16px 18px 15px;
+          min-height: var(--cardh, 104px);
+          display: flex; justify-content: space-between; align-items: flex-end; gap: 14px; }
+  .l { min-width: 0; }
+  .r { text-align: right; }
+  .cap.rr { text-align: right; }
+
+  /* 右侧贴片模式：文字收进左边单列，图片占右侧。
+     两列布局配整卡背景图必然打架——金额会压在图上看不清。 */
+  [data-img=side] .body { display: block; padding-right: calc(var(--iw,45%) + 10px); }
+  [data-img=side] .num { font-size: 30px; }
+  [data-img=side] .num .s { font-size: 14px; }
+  [data-img=side] .money { font-size: 16px; }
+  [data-img=side] .money i { font-size: 10px; }
+  [data-img=side] .r { display: flex; align-items: baseline; gap: 9px;
+                       text-align: left; margin-top: 3px; }
+  [data-img=side] .cap.rr { text-align: left; }
+  [data-img=side] .photo {
+    inset: 0 0 0 auto; width: var(--iw, 45%);
+    -webkit-mask-image: linear-gradient(to left, #000 var(--fadestop,55%), transparent);
+    mask-image: linear-gradient(to left, #000 var(--fadestop,55%), transparent);
+  }
+    .grab { cursor: grab; }
+  .num {
+    font-family: var(--display); font-variant-numeric: tabular-nums;
+    font-size: 38px; font-weight: 300; line-height: .95; letter-spacing: -.5px;
+  }
+  .num.text { font-size: 27px; letter-spacing: 1px; }
+  .num .s { font-size: 17px; color: var(--fg2); margin-left: 5px; }
+  .money {
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    font-size: 23px; color: var(--accent); text-align: right; line-height: 1;
+    letter-spacing: -.5px; white-space: nowrap;
+  }
+  .money i { font-style: normal; font-size: 13px; opacity: .65; margin-right: 1px; }
+  .cap { font-size: 11px; color: var(--fg2); font-variant-numeric: tabular-nums;
+         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cap.r { text-align: right; }
+
+  /* 齿轮平时隐身，鼠标进卡片才浮现 */
+  .gear {
+    position: absolute; top: 6px; right: 8px; z-index: 4;
+    background: none; border: 0; padding: 4px; cursor: pointer;
+    color: var(--fg2); font-size: 12px; line-height: 1;
+    opacity: 0; transition: opacity .15s;
+  }
+  .widget:hover .gear, .gear:focus-visible { opacity: 1; }
+  .gear:hover { color: var(--accent); }
+
+  /* ---------- 设置面板 ---------- */
+  .panel { display: none; position: relative; z-index: 2;
+           padding: 12px 18px 16px; font-size: 12px; color: var(--fg);
+           border-top: 1px solid var(--hair); text-shadow: none; }
+  .panel .row > span, .panel .sect, .panel .tip,
+  .panel .chk, .panel .grp > summary { color: var(--fg3); }
+  .panel.on { display: block; }
+  .panel::-webkit-scrollbar { width: 6px; }
+  .panel::-webkit-scrollbar-thumb { background: var(--plate2); border-radius: 3px; }
+  .panel::-webkit-scrollbar-track { background: transparent; }
+
+  .quick { display: flex; gap: 6px; padding-bottom: 12px; }
+  .quick button {
+    flex: 1; font: inherit; padding: 6px; cursor: pointer; color: var(--fg);
+    background: var(--plate); border: 1px solid var(--plate2); border-radius: 8px;
+  }
+  .quick button:hover { border-color: var(--accent); color: var(--accent); }
+  .quick button:last-child:hover { border-color: #ff6b6b; color: #ff6b6b; }
+
+  .grp { border-bottom: 1px solid var(--hair); }
+  .grp:last-of-type { border-bottom: 0; }
+  .grp > summary {
+    list-style: none; cursor: pointer; padding: 10px 0;
+    font-size: 10px; letter-spacing: 1.2px; color: var(--fg2); font-weight: 600;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .grp > summary::-webkit-details-marker { display: none; }
+  .grp > summary::before { content: '▸'; font-size: 9px; transition: transform .15s; }
+  .grp[open] > summary::before { transform: rotate(90deg); }
+  .grp > summary:hover { color: var(--accent); }
+  .grp > .inner { padding-bottom: 12px; }
+
+  .row { display: grid; grid-template-columns: 58px 1fr 30px; gap: 9px;
+         align-items: center; margin-bottom: 5px; }
+  .row > span { color: var(--fg2); }
+  .row output { text-align: right; color: var(--fg2); font-family: var(--mono); font-size: 11px; }
+  input, select { font: inherit; width: 100%; padding: 4px 7px; color: var(--fg);
+                  background: var(--plate); border: 1px solid var(--plate2); border-radius: 7px; }
+  input[type=range] { padding: 0; border: 0; background: none; accent-color: var(--accent); }
+  input[type=checkbox] { width: auto; }
+  .sect { font-size: 10px; letter-spacing: 1px; color: var(--fg2); margin: 12px 0 6px; }
+  .btns { display: flex; gap: 6px; }
+  .btns button { flex: 1; font: inherit; padding: 6px; cursor: pointer; color: var(--fg);
+                 background: var(--plate); border: 1px solid var(--plate2); border-radius: 8px; }
+  .btns button:hover { border-color: var(--accent); color: var(--accent); }
+  .btns button.act { border-color: var(--accent); color: var(--accent); }
+  .chk { display: flex; align-items: center; gap: 7px; margin-top: 8px; color: var(--fg2); }
+  .hide { display: none !important; }
+  .tip { color: var(--fg2); font-size: 11px; margin: -1px 0 8px; }
+
+  .slot { display: grid; grid-template-columns: 1fr 68px 1fr 20px; gap: 6px;
+          align-items: center; margin-bottom: 6px; }
+  .slot .del { background: none; border: 0; color: var(--fg2); cursor: pointer;
+               font-size: 15px; line-height: 1; padding: 0; }
+  .slot .del:hover { color: #ff6b6b; }
+  .add { width: 100%; font: inherit; padding: 5px; cursor: pointer; color: var(--fg2);
+         background: none; border: 1px dashed var(--plate2); border-radius: 8px; }
+  .add:hover { color: var(--accent); border-color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+<div class="widget" id="widget">
+  <div class="photo" id="photo"><img id="img" alt=""></div>
+  <div class="scrim" id="scrim"></div>
+  <div class="grain"></div>
+  <button class="gear" data-act="cfg" title="设置">⚙</button>
+  <div class="body grab pywebview-drag-region" id="grab">
+    <div class="l">
+      <div class="num" id="num"><span id="big">--:--</span><span class="s" id="sec">--</span></div>
+      <div class="cap" id="capL">—</div>
+    </div>
+    <div class="r">
+      <div class="money"><i>¥</i><span id="earn">0.00</span></div>
+      <div class="cap rr" id="capR">—</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="panel">
+
+  <div class="quick">
+    <button data-act="min">隐藏到托盘</button>
+    <button data-act="quit">退出程序</button>
+  </div>
+
+  <details class="grp" open>
+    <summary>工作时间</summary>
+    <div class="inner">
+      <div class="row"><span>上班</span><input type="time" id="c-start" value="09:30"><i></i></div>
+      <div class="row"><span>下班</span><input type="time" id="c-end" value="18:30"><i></i></div>
+      <div class="row"><span>月薪</span><input type="number" id="c-salary" value="12000" min="0"><i></i></div>
+      <div class="row"><span>文案</span><input type="text" id="s-work-t" maxlength="12" placeholder="距下班"><i></i></div>
+      <div class="tip">上班时左下角显示它，可打 emoji，比如「🐮 牛马中」</div>
+    </div>
+  </details>
+
+  <details class="grp" open>
+    <summary>右下角倒计时</summary>
+    <div class="inner">
+      <div id="slots"></div>
+      <button class="add" data-act="addslot">+ 添加一项</button>
+    </div>
+  </details>
+
+  <details class="grp" id="grp-img">
+    <summary>背景图片</summary>
+    <div class="inner">
+      <div class="btns">
+        <button data-act="pick">导入图片</button>
+        <button data-act="move" id="btn-move" class="hide">拖动定位</button>
+        <button data-act="clear" id="btn-clear" class="hide">移除</button>
+      </div>
+      <div class="btns hide" id="btn-fitrow" style="margin-top:6px">
+        <button data-act="autofit">按图片比例调整卡片</button>
+      </div>
+      <div id="imgopts" class="hide">
+        <div class="sect">尺寸位置</div>
+        <div class="row"><span>布局</span>
+          <select id="c-ilay">
+            <option value="side">右侧贴片（文字在左，不遮挡）</option>
+            <option value="full">整卡背景（需调高文字底衬）</option>
+          </select><i></i>
+        </div>
+        <div class="row" id="wrap-iw"><span>占宽</span><input type="range" id="v-iw" min="25" max="65" value="45"><output></output></div>
+        <div class="row" id="wrap-fade"><span>淡出</span><input type="range" id="v-fade" min="0" max="100" value="45"><output></output></div>
+        <div class="row"><span>显示</span>
+          <select id="c-ifit">
+            <option value="cover">铺满（会裁掉超出部分）</option>
+            <option value="contain">完整（留边，方图选这个）</option>
+          </select><i></i>
+        </div>
+        <div class="row"><span>卡片高</span><input type="range" id="v-cardh" min="90" max="280" step="2" value="104"><output></output></div>
+        <div class="row"><span>缩放</span><input type="range" id="v-iscale" min="50" max="300" value="100"><output></output></div>
+        <div class="sect">调色</div>
+        <div class="row"><span>亮度</span><input type="range" id="v-br" min="0" max="200" value="100"><output></output></div>
+        <div class="row"><span>对比</span><input type="range" id="v-ct" min="0" max="200" value="100"><output></output></div>
+        <div class="row"><span>饱和</span><input type="range" id="v-sa" min="0" max="300" value="100"><output></output></div>
+        <div class="row"><span>色相</span><input type="range" id="v-hu" min="0" max="360" value="0"><output></output></div>
+        <div class="row"><span>模糊</span><input type="range" id="v-bl" min="0" max="20" value="0"><output></output></div>
+        <div class="row"><span>透明</span><input type="range" id="v-op" min="0" max="100" value="100"><output></output></div>
+        <div class="sect">融合</div>
+        <div class="row" id="wrap-scrim"><span>文字底衬</span><input type="range" id="v-scrim" min="0" max="100" value="55"><output></output></div>
+        <div class="row"><span>叠加</span>
+          <select id="c-blend">
+            <option value="normal">正常</option><option value="multiply">正片叠底</option>
+            <option value="screen">滤色</option><option value="overlay">叠加</option>
+            <option value="soft-light">柔光</option><option value="luminosity">明度</option>
+          </select><i></i>
+        </div>
+      </div>
+    </div>
+  </details>
+
+  <details class="grp">
+    <summary>窗口</summary>
+    <div class="inner">
+      <label class="chk"><input type="checkbox" id="c-auto"> 开机自启</label>
+      <label class="chk"><input type="checkbox" id="c-top" checked> 窗口置顶</label>
+      <div class="row"><span>背景</span>
+        <select id="c-bg">
+          <option value="auto">纯色 · 跟随系统深浅</option>
+          <option value="glass">毛玻璃（Win10 上有白底问题）</option>
+          <option value="light">纯白</option>
+          <option value="dark">纯黑</option>
+        </select><i></i>
+      </div>
+      <label class="chk" id="wrap-acrylic"><input type="checkbox" id="c-acrylic"> 亚克力质感</label>
+      <div class="tip" id="tip-acrylic">Win10 上亚克力只在窗口激活时才模糊，失焦会变成一块纯色。不勾选则用老式模糊，观感朴素但一直有效。</div>
+      <div style="height:10px"></div>
+      <div class="row"><span>尺寸</span><input type="range" id="v-ui" min="75" max="150" step="5" value="100"><output></output></div>
+      <div class="row" id="wrap-glass"><span>玻璃浓度</span><input type="range" id="v-glass" min="0" max="230" value="90"><output></output></div>
+      <div class="row" id="wrap-grain"><span>颗粒感</span><input type="range" id="v-grain" min="0" max="20" value="5"><output></output></div>
+    </div>
+  </details>
+
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = () => window.pywebview && window.pywebview.api;
+
+const SLIDERS = {
+  iscale:['--iscale','',100], br:['--br','',100], ct:['--ct','',100],
+  sa:['--sa','',100], hu:['--hu','deg',1], bl:['--bl','px',1],
+  op:['--op','',100], scrim:['--scrimo','',100], grain:['--grain','',100],
+  ui:['--ui','',100], cardh:['--cardh','px',1],
+  iw:['--iw','%',1], fade:['--fadestop','%',1]
+};
+const FIELDS = ['start','end','salary','blend','ifit','ilay'];
+const DEF_WORK = '距下班';
+const DEF_SLOTS = [
+  { label:'周五', type:'weekly',  value:'5'  },
+  { label:'发薪', type:'monthly', value:'10' }
+];
+
+let cfg = {}, imgPos = {x:0,y:0}, editing = false, ready = false, slots = [];
+
+// 只在值真的变了才写，否则改动 zoom 会触发重排、清掉面板滚动位置
+function setVar(el, name, val) {
+  if (el.style.getPropertyValue(name) !== val) el.style.setProperty(name, val);
+}
+
+function paint() {
+  // zoom 作用在 body 上，尺寸变量必须设到 documentElement
+  setVar(document.documentElement, '--ui', String(+$('#v-ui').value / 100));
+  $('#v-ui').nextElementSibling.textContent = $('#v-ui').value;
+
+  const w = $('#widget');
+  for (const [k,[v,unit,div]] of Object.entries(SLIDERS)) {
+    let n = +$('#v-'+k).value;
+    if (k === 'fade') n = 100 - n;      // 滑块越大淡出范围越广
+    setVar(w, v, (n/div) + unit);
+    const out = $('#v-'+k).nextElementSibling;
+    if (out) out.textContent = $('#v-'+k).value;
+  }
+  // 调色值全是默认就不生成 filter，混合模式为正常就不挂 mix-blend-mode
+  const dflt = { br:100, ct:100, sa:100, hu:0, bl:0 };
+  const on = Object.keys(dflt).some(k => +$('#v-'+k).value !== dflt[k]);
+  const img = $('#img');
+  if (on) {
+    setVar(w, '--fx',
+      `brightness(${+$('#v-br').value/100}) contrast(${+$('#v-ct').value/100}) ` +
+      `saturate(${+$('#v-sa').value/100}) hue-rotate(${$('#v-hu').value}deg) ` +
+      `blur(${$('#v-bl').value}px)`);
+  }
+  img.classList.toggle('fx', on);
+
+  const blend = $('#c-blend').value;
+  if (blend !== 'normal') setVar(w, '--blend', blend);
+  img.classList.toggle('bl', blend !== 'normal');
+
+  setVar(w, '--ifit', $('#c-ifit').value);
+  setVar(w, '--ix', imgPos.x + 'px');
+  setVar(w, '--iy', imgPos.y + 'px');
+}
+
+function setImage(dataUrl) {
+  const has = !!dataUrl;
+  $('#img').src = dataUrl || '';
+  $('#img').style.display = has ? '' : 'none';
+  ['#btn-move','#btn-clear','#imgopts','#btn-fitrow'].forEach(s => $(s).classList.toggle('hide', !has));
+  if (!has && editing) toggleEditing(false);
+  applyLayout(has);
+}
+
+/* 按图片实际比例反推卡片尺寸，省得手动试 */
+const CARD_W = 320, H_MIN = 90, H_MAX = 280, IW_MIN = 25, IW_MAX = 65;
+
+function autoFitImage() {
+  const im = $('#img');
+  const nw = im.naturalWidth, nh = im.naturalHeight;
+  if (!nw || !nh) return false;
+  const ratio = nw / nh;
+
+  if ($('#c-ilay').value === 'full') {
+    // 整卡背景：卡片宽固定，高度直接由比例决定
+    const h = Math.round(CARD_W / ratio);
+    $('#v-cardh').value = Math.max(H_MIN, Math.min(H_MAX, h));
+  } else {
+    // 右侧贴片：先按当前占宽算需要多高
+    let iw = +$('#v-iw').value || 45;
+    let h = (CARD_W * iw / 100) / ratio;
+    if (h > H_MAX) {
+      // 太高了，反过来压缩占宽，让高度落回上限
+      h = H_MAX;
+      iw = Math.round(h * ratio / CARD_W * 100);
+      iw = Math.max(IW_MIN, Math.min(IW_MAX, iw));
+      h = (CARD_W * iw / 100) / ratio;      // 占宽被钳过，高度重算
+    }
+    $('#v-iw').value = iw;
+    $('#v-cardh').value = Math.max(H_MIN, Math.min(H_MAX, Math.round(h)));
+  }
+  // 卡片已经贴合比例，铺满和完整效果一致，选铺满避免边缘留白
+  $('#c-ifit').value = 'cover';
+  $('#v-iscale').value = 100;
+  imgPos = { x: 0, y: 0 };
+  paint(); save(); requestAnimationFrame(fit);
+  return true;
+}
+
+// naturalWidth 要等图片解码完才有值
+let pendingAutoFit = false;
+$('#img').addEventListener('load', () => {
+  if (pendingAutoFit) { pendingAutoFit = false; autoFitImage(); }
+});
+
+/* 布局跟着有没有图片走：没图两列铺满，有图收成单列给图片让位 */
+function applyLayout(has) {
+  const root = document.documentElement;
+  const mode = has ? $('#c-ilay').value : '';        // side | full | 空
+  if (mode) root.dataset.img = mode; else delete root.dataset.img;
+  const side = mode === 'side';
+  ['#wrap-iw','#wrap-fade'].forEach(sel => $(sel).classList.toggle('hide', !side));
+  $('#wrap-scrim').classList.toggle('hide', mode !== 'full');
+}
+
+/* 拖动定位：必须先摘掉 WebView2 的窗口拖动区，否则事件到不了这里 */
+function toggleEditing(on) {
+  editing = on;
+  $('#photo').classList.toggle('editing', on);
+  $('#grab').classList.toggle('pywebview-drag-region', !on);
+  const b = $('#btn-move');
+  b.textContent = on ? '完成定位' : '拖动定位';
+  b.classList.toggle('act', on);
+}
+
+/* ---------- 倒计时槽位 ---------- */
+const clampInt = (v, lo, hi) => Math.min(hi, Math.max(lo, parseInt(v, 10) || lo));
+const daysWeekly = (now, d) => (d - now.getDay() + 7) % 7;
+function daysMonthly(now, day) {
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const next = new Date(now.getFullYear(), now.getMonth(), day);
+  if (next < today) next.setMonth(next.getMonth() + 1);
+  return Math.round((next - today) / 864e5);
+}
+function daysDate(now, iso) {
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const t = new Date(iso + 'T00:00:00');
+  return isNaN(t) ? null : Math.round((t - today) / 864e5);
+}
+
+function renderSlots() {
+  const box = $('#slots');
+  box.innerHTML = '';
+  slots.forEach((s, i) => {
+    const el = document.createElement('div');
+    el.className = 'slot';
+    el.innerHTML =
+      `<input type="text" maxlength="6" data-i="${i}" data-f="label" placeholder="标签">
+       <select data-i="${i}" data-f="type">
+         <option value="weekly">每周</option>
+         <option value="monthly">每月</option>
+         <option value="date">指定日</option>
+       </select>
+       <span data-hold="${i}"></span>
+       <button class="del" data-act="delslot" data-i="${i}" title="删除">×</button>`;
+    box.appendChild(el);
+    el.querySelector('input').value = s.label;
+    el.querySelector('select').value = s.type;
+    el.querySelector(`[data-hold="${i}"]`).appendChild(buildValueInput(s, i));
+  });
+}
+
+function buildValueInput(s, i) {
+  let el;
+  if (s.type === 'weekly') {
+    el = document.createElement('select');
+    ['周日','周一','周二','周三','周四','周五','周六'].forEach((n, d) => {
+      const o = document.createElement('option');
+      o.value = d; o.textContent = n; el.appendChild(o);
+    });
+    el.value = s.value;
+  } else if (s.type === 'monthly') {
+    el = document.createElement('input');
+    el.type = 'number'; el.min = 1; el.max = 28; el.value = s.value;
+  } else {
+    el = document.createElement('input');
+    el.type = 'date'; el.value = s.value;
+  }
+  el.dataset.i = i; el.dataset.f = 'value';
+  return el;
+}
+
+$('#slots').addEventListener('input', e => {
+  const i = e.target.dataset.i, f = e.target.dataset.f;
+  if (i == null || !f) return;
+  let v = e.target.value;
+  if (f === 'value' && slots[i].type === 'monthly') {      // number 的 max 不强制，自己钳
+    v = clampInt(v, 1, 28);
+    if (String(v) !== e.target.value) e.target.value = v;
+  }
+  slots[i][f] = String(v);
+  if (f === 'type') {
+    slots[i].value = v === 'weekly' ? '5' : v === 'monthly' ? '10'
+                   : new Date().toISOString().slice(0,10);
+    renderSlots();
+  }
+  tick(); save();
+});
+
+/* ---------- 主循环 ---------- */
+const hm = s => { const [h,m] = s.split(':').map(Number); return h*60+m; };
+const pad = n => String(n).padStart(2,'0');
+
+function tick() {
+  const now = new Date();
+  const cur = now.getHours()*60 + now.getMinutes() + now.getSeconds()/60;
+  const st = hm($('#c-start').value), ed = hm($('#c-end').value);
+  const salary = +$('#c-salary').value || 0;
+  const weekend = now.getDay() === 0 || now.getDay() === 6;
+  let prog = 0;
+
+  const show = (big, sec) => {
+    $('#big').textContent = big;
+    $('#sec').textContent = sec || '';
+    $('#num').classList.toggle('text', !sec);
+  };
+
+  if (weekend) {
+    show('休息日'); $('#capL').textContent = '不计薪';
+  } else if (cur >= ed) {
+    show('已下班'); $('#capL').textContent = '今天到此为止'; prog = 1;
+  } else if (cur < st) {
+    const d = Math.round((st-cur)*60);
+    show(`${pad(d/3600|0)}:${pad(d/60%60|0)}`, pad(d%60));
+    $('#capL').textContent = `距上班 · ${$('#c-start').value}`;
+  } else {
+    const d = Math.round((ed-cur)*60);
+    show(`${pad(d/3600|0)}:${pad(d/60%60|0)}`, pad(d%60));
+    prog = (cur-st)/(ed-st);
+    const label = $('#s-work-t').value.trim() || DEF_WORK;
+    $('#capL').textContent = `${label} · ${$('#c-end').value}`;
+  }
+
+  $('#earn').textContent = (salary/21.75*prog).toFixed(2);
+
+  const parts = [];
+  slots.forEach(sl => {
+    const d = sl.type === 'weekly'  ? daysWeekly(now, +sl.value)
+            : sl.type === 'monthly' ? daysMonthly(now, clampInt(sl.value,1,28))
+            : daysDate(now, sl.value);
+    if (d != null && d >= 0) parts.push(`${sl.label} ${d} 天`);
+  });
+  $('#capR').textContent = parts.join(' · ') || '今日收入';
+}
+
+/* ---------- 存取 ---------- */
+function collect() {
+  const o = { img_file: cfg.img_file || '', ix: imgPos.x, iy: imgPos.y, slots };
+  FIELDS.forEach(k => o[k] = $('#c-'+k).value);
+  Object.keys(SLIDERS).forEach(k => o[k] = $('#v-'+k).value);
+  o.s_work_t = $('#s-work-t').value;
+  o.top = $('#c-top').checked;
+  o.acrylic = $('#c-acrylic').checked;
+  o.glass = $('#v-glass').value;
+  o.bg = $('#c-bg').value;
+  return o;
+}
+function applyCfg(o) {
+  FIELDS.forEach(k => { if (o[k] != null) $('#c-'+k).value = o[k]; });
+  Object.keys(SLIDERS).forEach(k => { if (o[k] != null) $('#v-'+k).value = o[k]; });
+  if (o.s_work_t != null) $('#s-work-t').value = o.s_work_t;
+  imgPos = { x:+o.ix||0, y:+o.iy||0 };
+  if (o.top != null) $('#c-top').checked = o.top;
+  if (o.acrylic != null) $('#c-acrylic').checked = o.acrylic;
+  if (o.glass != null) $('#v-glass').value = o.glass;
+  if (o.bg != null) $('#c-bg').value = o.bg;
+  applyBg();
+  slots = Array.isArray(o.slots) && o.slots.length
+        ? o.slots : JSON.parse(JSON.stringify(DEF_SLOTS));
+  cfg = o;
+  renderSlots(); setImage(o.img_data || ''); paint(); tick();
+}
+const save = () => ready && api().save_config(collect());
+
+let fitTimer = null;
+function fit() {                    // 对外的入口，做节流
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(fitNow, 60);
+}
+function fitNow() {
+  const a = api(); if (!a) return;
+  const keepScroll = $('#panel').scrollTop;
+  const dpr = window.devicePixelRatio || 1;
+  const scale = (+$('#v-ui').value || 100) / 100;
+  const p = $('#panel');
+
+  // zoom 下 offsetHeight 拿到的是未缩放值，必须用 getBoundingClientRect
+  const wh = $('#widget').getBoundingClientRect().height;
+  p.style.maxHeight = 'none';
+  p.style.overflowY = 'hidden';
+
+  let ph = 0;
+  if (p.classList.contains('on')) {
+    const budget = Math.max(180, screen.availHeight - wh - 48);
+    ph = p.getBoundingClientRect().height;
+    if (ph > budget) {
+      ph = budget;
+      p.style.maxHeight = (budget / scale) + 'px';   // maxHeight 用的是未缩放单位
+      p.style.overflowY = 'auto';
+    }
+  }
+  p.scrollTop = keepScroll;         // 改 maxHeight 会清掉滚动偏移，还原回去
+  a.resize(Math.round(320 * scale * dpr), Math.round((wh + ph) * dpr));
+}
+
+let sysDark = true;
+async function syncTheme() {
+  const a = api(); if (!a) return;
+  const t = await a.get_theme();
+  const changed = sysDark !== t.dark;
+  sysDark = t.dark;
+  setVar(document.documentElement, '--accent', t.accent);
+  if (changed) applyBg();      // 系统深浅没变就别重刷，否则每 20 秒抖一下
+}
+
+/* 背景模式决定深浅色和是否启用系统毛玻璃 */
+function applyBg() {
+  const mode = $('#c-bg').value || 'auto';
+  const glass = mode === 'glass';
+  const dark = mode === 'dark' ? true
+             : mode === 'light' ? false
+             : sysDark;
+  const root = document.documentElement;
+  root.dataset.theme = dark ? 'dark' : 'light';
+  root.dataset.bg = glass ? 'glass' : 'solid';
+  ['#wrap-acrylic','#tip-acrylic','#wrap-glass','#wrap-grain'].forEach(sel =>
+    $(sel).classList.toggle('hide', !glass));
+  refreshGlass();
+}
+
+/* ---------- 交互 ---------- */
+document.addEventListener('input', e => {
+  if (e.target.closest('#slots') || e.target.id === 'v-glass') return;
+  paint(); tick(); save();
+  if (e.target.id === 'v-ui' || e.target.id === 'v-cardh') requestAnimationFrame(fit);
+});
+$('#c-top').addEventListener('change', e => api().set_topmost(e.target.checked));
+$('#c-auto').addEventListener('change', e => api().set_autostart(e.target.checked));
+
+let glassTimer = null;
+const refreshGlass = () => {
+  clearTimeout(glassTimer);
+  glassTimer = setTimeout(() => {
+    const a = api(); if (!a) return;
+    const dark = document.documentElement.dataset.theme === 'dark';
+    a.refresh_glass($('#c-acrylic').checked, +$('#v-glass').value,
+                    $('#c-bg').value === 'glass',
+                    dark ? '#191c21' : '#ffffff');
+  }, 120);                       // 拖滑块时节流，别每像素都调一次系统 API
+};
+$('#c-acrylic').addEventListener('change', () => { refreshGlass(); save(); });
+$('#c-bg').addEventListener('change', () => { applyBg(); save(); requestAnimationFrame(fit); });
+$('#c-ilay').addEventListener('change', () => {
+  applyLayout(!!$('#img').src);
+  if (!autoFitImage()) { save(); requestAnimationFrame(fit); }
+});
+$('#v-glass').addEventListener('input', () => {
+  $('#v-glass').nextElementSibling.textContent = $('#v-glass').value;
+  refreshGlass(); save();
+});
+document.querySelectorAll('.grp').forEach(d =>
+  d.addEventListener('toggle', () => requestAnimationFrame(fit)));
+
+document.body.addEventListener('click', async e => {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act, a = api();
+
+  if (act === 'cfg') {
+    const on = $('#panel').classList.toggle('on');
+    // 面板一关，「拖动定位」按钮就看不见了，模式必须跟着退出，
+    // 否则拖卡片拖的是图片，用户没法把窗口挪走
+    if (!on && editing) toggleEditing(false);
+    requestAnimationFrame(fit);
+    return;
+  }
+  if (act === 'addslot') {
+    if (slots.length >= 4) return;          // 右下角一行放得下的上限
+    slots.push({ label:'节日', type:'date', value:new Date().toISOString().slice(0,10) });
+    renderSlots(); tick(); save(); requestAnimationFrame(fit); return;
+  }
+  if (act === 'delslot') {
+    slots.splice(+btn.dataset.i, 1);
+    renderSlots(); tick(); save(); requestAnimationFrame(fit); return;
+  }
+  if (!a) return;
+  if (act === 'min') a.minimize();
+  else if (act === 'quit') a.quit();
+  else if (act === 'autofit') { autoFitImage(); }
+  else if (act === 'pick') {
+    const r = await a.pick_image();
+    if (r) {
+      cfg.img_file = r.file;
+      pendingAutoFit = true;          // 图片解码完再量尺寸
+      setImage(r.data);
+      save(); requestAnimationFrame(fit);
+    }
+  } else if (act === 'clear') {
+    await a.clear_image(); cfg.img_file = ''; setImage(''); save(); requestAnimationFrame(fit);
+  } else if (act === 'move') {
+    toggleEditing(!editing);
+  }
+});
+
+let drag = null;
+$('#photo').addEventListener('pointerdown', e => {
+  if (!editing) return;
+  drag = { x: e.clientX-imgPos.x, y: e.clientY-imgPos.y };
+  $('#photo').setPointerCapture(e.pointerId);
+});
+$('#photo').addEventListener('pointermove', e => {
+  if (!drag) return;
+  imgPos = { x: e.clientX-drag.x, y: e.clientY-drag.y };
+  paint();
+});
+$('#photo').addEventListener('pointerup', () => { if (drag) { drag = null; save(); } });
+
+/* ---------- 启动 ---------- */
+async function boot() {
+  await syncTheme();
+  const saved = await api().load_config();
+  ready = true;
+  $('#c-auto').checked = await api().get_autostart();
+  applyCfg(saved || {});
+  requestAnimationFrame(fit);
+  setInterval(tick, 1000);
+  setInterval(syncTheme, 20000);
+}
+if (window.pywebview) boot();
+else window.addEventListener('pywebviewready', boot);
+setTimeout(() => {
+  if (!ready) {
+    sysDark = !matchMedia('(prefers-color-scheme: light)').matches;
+    applyCfg({}); setInterval(tick, 1000);
+  }
+}, 800);
+</script>
