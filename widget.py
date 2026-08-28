@@ -33,6 +33,7 @@ STARTUP_VBS = os.path.join(
 os.makedirs(IMGDIR, exist_ok=True)
 
 SS = 3              # 圆角超采样倍数，画大 3 倍再缩回来就有抗锯齿了
+DOCK_SNAP = 28      # 拖动结束时离边缘小于这个距离就算吸附
 RADIUS = 16
 
 DEFAULTS = {
@@ -56,6 +57,9 @@ DEFAULTS = {
     "shuffle": True,           # 随机还是按文件名顺序
     "alttab": False,           # 是否出现在 Alt+Tab 列表里
     "top": True, "wx": None, "wy": None,
+    "dock": True,              # 拖到屏幕边缘时自动吸附
+    "dock_x": "", "dock_y": "",   # 吸在哪条边：left/right、top/bottom，空=没吸
+    "dock_pad": 12,            # 吸附后离边缘留多少像素
     "slots": [{"label": "周五", "type": "weekly", "value": "5"},
               {"label": "发薪", "type": "monthly", "value": "10"}],
 }
@@ -1307,6 +1311,7 @@ class Widget:
                 self.paint()
             return 0
         if msg == WM_EXITSIZEMOVE:
+            self.detect_dock()          # 松手时判断有没有靠到边缘
             # DWM 的模糊会缓存一份采样，窗口移走后不重新取，
             # 卡片里就显示着旧位置的内容。拖动结束重新申请一次逼它刷新。
             self.apply_blur()
@@ -1325,6 +1330,9 @@ class Widget:
                 return 0
             user32.ReleaseCapture()                          # 其余位置拖动窗口
             user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+            # SendMessageW 会一直阻塞到拖动结束，所以这里已经是松手之后了。
+            # 先吸附再存位置，否则存下来的是吸附前那个坐标。
+            self.detect_dock()
             self.save_pos()
             return 0
         if msg == WM_RBUTTONUP or msg == WM_LBUTTONDBLCLK:
@@ -1403,6 +1411,8 @@ class Widget:
 
     def center(self):
         """窗口拖丢了用这个找回来"""
+        self.cfg["dock_x"] = self.cfg["dock_y"] = ""
+        write_cfg({"dock_x": "", "dock_y": ""})   # 居中就不该再被吸回边上
         wa = self.work_area()
         w, h = self.size
         x = wa.left + (wa.right - wa.left - w) // 2
@@ -1529,22 +1539,76 @@ class Widget:
         return wa
 
     def nudge_onscreen(self):
-        """只在卡片尺寸变化后校正一次，不能每帧都做，否则会跟拖动循环打架"""
+        """只在卡片尺寸变化后校正一次，不能每帧都做，否则会跟拖动循环打架。
+
+        换图会改卡片尺寸（占宽是按图片比例算的），如果之前吸在右边或下边，
+        尺寸一变就得重新贴——不然横图换成竖图时卡片变宽，右边那截会顶出
+        屏幕；贴底的会压到任务栏上。所以这里先按记下的边重贴，再夹一次边界。
+        """
         r = wt.RECT()
         user32.GetWindowRect(self.hwnd, ctypes.byref(r))
         wa = self.work_area()
         w, h = self.size
-        nx = max(wa.left, min(r.left, wa.right - w))
-        ny = max(wa.top, min(r.top, wa.bottom - h))
+        pad = int(self.cfg.get("dock_pad", 12))
+        dx, dy = self.cfg.get("dock_x", ""), self.cfg.get("dock_y", "")
+        nx, ny = r.left, r.top
+        if dx == "left":
+            nx = wa.left + pad
+        elif dx == "right":
+            nx = wa.right - w - pad
+        if dy == "top":
+            ny = wa.top + pad
+        elif dy == "bottom":
+            ny = wa.bottom - h - pad
+        # 没吸附的那个轴仍然要保证不出屏
+        nx = max(wa.left, min(nx, wa.right - w))
+        ny = max(wa.top, min(ny, wa.bottom - h))
         if (nx, ny) != (r.left, r.top):
             user32.SetWindowPos(self.hwnd, None, nx, ny, 0, 0,
                                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER)
+
+    def detect_dock(self):
+        """拖动结束时判断有没有靠边。两个轴分开记，所以四个角也能吸住。
+
+        判定用的是"卡片边缘到工作区边缘的距离"，阈值里加上 dock_pad——
+        否则吸附完成后卡片离边缘正好是 pad，下次再拖一点点就会被判定成
+        没吸附，表现为吸附状态自己丢掉。
+        """
+        if not self.cfg.get("dock", True):
+            return
+        r = wt.RECT()
+        user32.GetWindowRect(self.hwnd, ctypes.byref(r))
+        wa = self.work_area()
+        pad = int(self.cfg.get("dock_pad", 12))
+        snap = int(DOCK_SNAP * self.uiscale()) + pad
+        dx = dy = ""
+        if abs(r.left - wa.left) <= snap:
+            dx = "left"
+        elif abs(wa.right - r.right) <= snap:
+            dx = "right"
+        if abs(r.top - wa.top) <= snap:
+            dy = "top"
+        elif abs(wa.bottom - r.bottom) <= snap:
+            dy = "bottom"
+        self.cfg["dock_x"], self.cfg["dock_y"] = dx, dy
+        write_cfg({"dock_x": dx, "dock_y": dy})
+        self.nudge_onscreen()
 
     def show(self, v):
         user32.ShowWindow(self.hwnd, SW_SHOW if v else SW_HIDE)
 
     def quit(self):
         self.save_pos()
+        # 托盘图标必须显式删掉。进程直接退出的话 Windows 不会自动清，
+        # 图标会一直留在托盘里（"幽灵图标"），要等鼠标划过去探测才消失。
+        # 之前只有托盘菜单的「退出」调了 icon.stop()，设置窗口的
+        # 「退出程序」没调，每退一次就攒一个。
+        try:
+            if _TRAY[0] is not None:
+                _TRAY[0].stop()
+                _TRAY[0] = None
+        except Exception:
+            pass
         user32.PostMessageW(self.hwnd, WM_DESTROY, 0, 0)
 
 
@@ -1582,11 +1646,41 @@ def auto_fit(cfg):
 
 TAB_KEYS = {
     "工作": ["start", "end", "salary", "cur_sym", "sym_gap", "work_text", "show_money"],
-    "外观": ["bg", "ui", "cardw", "cardh", "glass", "top", "alttab", "auto_size"],
+    "外观": ["bg", "ui", "cardw", "cardh", "glass", "top", "alttab", "auto_size", "dock", "dock_pad"],
     "图片": ["img_fill", "img_side", "text_pct", "iw", "iw_auto", "ix", "iy",
              "fade", "rotate_min", "shuffle", "auto_resize"],
     "倒计时": ["slots", "slot_rows"],
 }
+
+
+def place_settings(root, widget):
+    """把设置窗口摆到组件旁边的空白处。
+
+    组件是置顶的，设置窗口压在它上面就看不见改动效果，只能一边改一边挪窗口。
+    尺寸要等控件都建完才准，所以这一步放在 mainloop 之前做，不能在 Tk() 之后
+    就算——那时候 winfo 拿到的还是 1x1。
+    """
+    root.update_idletasks()
+    w = max(root.winfo_reqwidth(), root.winfo_width())
+    h = max(root.winfo_reqheight(), root.winfo_height())
+    try:
+        r = wt.RECT()
+        user32.GetWindowRect(widget.hwnd, ctypes.byref(r))
+        wa = widget.work_area()
+    except Exception:
+        return
+    gap = 12
+    for x, y in ((r.right + gap, r.top),          # 右
+                 (r.left - w - gap, r.top),       # 左
+                 (r.left, r.bottom + gap),        # 下
+                 (r.left, r.top - h - gap)):      # 上
+        x = max(wa.left, min(x, wa.right - w))
+        y = max(wa.top, min(y, wa.bottom - h))
+        # 夹回工作区之后可能又压到组件上了，得重新判一次相交
+        if not (x < r.right and x + w > r.left and y < r.bottom and y + h > r.top):
+            root.geometry("+%d+%d" % (x, y))
+            return
+    root.geometry("+%d+%d" % (wa.left, wa.top))   # 四边都塞不下，贴左上角
 
 
 def open_settings(widget):
@@ -1630,10 +1724,10 @@ def _build(widget):
     _settings_root[0] = root
     root.title("下班倒计时 · 设置")
     root.resizable(False, False)
-    try:            # 开在组件所在的那块屏上，多屏时别跑到主屏去
-        r = wt.RECT()
-        user32.GetWindowRect(widget.hwnd, ctypes.byref(r))
-        root.geometry("+%d+%d" % (r.left, min(r.bottom + 8, r.top + 40)))
+    try:            # 先粗放一下，保证开在组件所在的那块屏上，多屏时别跑到主屏去
+        r0 = wt.RECT()
+        user32.GetWindowRect(widget.hwnd, ctypes.byref(r0))
+        root.geometry("+%d+%d" % (r0.left, r0.top))
     except Exception:
         pass
     try:
@@ -1813,6 +1907,15 @@ def _build(widget):
     ttk.Checkbutton(t2, text="开机自启", variable=auto_v,
                     command=lambda: set_autostart(auto_v.get())
                     ).grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
+
+    dock_v = tk.BooleanVar(value=bool(cfg.get("dock", True)))
+    VARS["dock"] = lambda val, v=dock_v: v.set(bool(val))
+    ttk.Checkbutton(t2, text="拖到屏幕边缘时自动吸附（换图变尺寸后重新贴边）",
+                    variable=dock_v,
+                    command=lambda: (write_cfg({"dock": dock_v.get()}),
+                                     widget.reload())
+                    ).grid(row=11, column=0, columnspan=3, sticky="w", pady=3)
+    add_scale(t2, 12, "贴边留白", "dock_pad", 0, 40, 12)
 
     # ================= 图片 =================
     t3 = ttk.Frame(nb, padding=12)
@@ -2126,6 +2229,7 @@ def _build(widget):
     ttk.Button(foot, text="关闭", command=root.destroy).pack(side="right")
 
     root.protocol("WM_DELETE_WINDOW", root.destroy)
+    place_settings(root, widget)
     root.mainloop()
 
 
@@ -2153,6 +2257,9 @@ def set_autostart(on):
 
 
 # ============================ 托盘 ============================
+_TRAY = [None]           # 托盘图标的引用，退出时要用它删图标
+
+
 def build_tray(widget):
     try:
         import pystray
@@ -2172,8 +2279,9 @@ def build_tray(widget):
         pystray.MenuItem("隐藏", lambda *_: widget.show(False)),
         pystray.MenuItem("回到屏幕中央", lambda *_: widget.center()),
         pystray.MenuItem("设置", lambda *_: open_settings(widget)),
-        pystray.MenuItem("退出", lambda i, *_: (i.stop(), widget.quit())),
+        pystray.MenuItem("退出", lambda i, *_: widget.quit()),
     ))
+    _TRAY[0] = icon
     icon.run()
 
 
