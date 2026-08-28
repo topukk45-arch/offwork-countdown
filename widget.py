@@ -5,6 +5,7 @@
 依赖: pip install pillow pystray
 运行: pythonw widget.py
 """
+import colorsys
 import ctypes
 import ctypes.wintypes as wt
 import json
@@ -33,8 +34,27 @@ STARTUP_VBS = os.path.join(
 os.makedirs(IMGDIR, exist_ok=True)
 
 SS = 3              # 圆角超采样倍数，画大 3 倍再缩回来就有抗锯齿了
+BIG_MAX = 0.33      # 主时间最多占文字区高度的比例。没有这条线的话，"撑满"就是
+                    # 一路放到高度装不下为止：文字区 300 高，主时间能长到 130px，
+                    # 再反推需要多宽的文字列，卡片会被撑成一块广告牌
+FIT_GROW_H = 1.6    # 竖版自动加高最多到设定高度的几倍。比横版收得紧：加高是
+                    # 为了在图片下面腾出一条放文字，不是把方卡拉成长条。2.5 倍
+                    # 时 300x300 会变成 300x592，早就不是"近似正方形"了
+FIT_GROW = 2.5      # 横版自动加宽最多加到设定宽度的几倍。加宽是为了省得手拖滑块，
+                    # 不是让滑块作废：不封顶的话，某些图片比例下它会一路顶到
+                    # W_MAX，你设的宽高就完全不起作用了
+IMG_MAX = 0.60      # 图片最多占卡片的几成（宽或高，看排法）。以前是个滑块，
+                    # 可它只在图片按比例算得过大时才起作用，平时纹丝不动，
+                    # 摆在设置里徒增困惑
+SLOT_MAX = 3        # 倒计时最多几项。这是个桌面小组件，不是日程表——
+                    # 六项在小卡片上本来也塞不下，砍行之后照样只显示三两条
 DOCK_SNAP = 28      # 拖动结束时离边缘小于这个距离就算吸附
 RADIUS = 16
+TEXT_CR = 4.5       # 次要文字和金额相对卡片底色的最低对比度（WCAG AA 正文档）。
+                    # 这两个颜色是一路混合出来的：次要文字先掺 45% 底色，开了
+                    # 取色再掺 38% 主色，叠完离底色只剩不到三成，而全程没有下限。
+                    # 浅色卡配暖色图时实测掉到 3.2，金额在默认浅蓝强调色下更是
+                    # 只有 2.0——那一档跟取色无关，白底浅蓝一直就看不清。
 
 DEFAULTS = {
     "start": "09:30", "end": "18:30", "salary": 12000,
@@ -42,17 +62,19 @@ DEFAULTS = {
     "cur_sym": "¥",            # 货币符号，从设置里的下拉框选
     "sym_gap": False,          # 符号和数字之间空一格
     "show_money": True,
+    "show_cap": True,          # 是否显示「距下班 · 18:30」那一行
     "bg": "auto",              # auto | light | dark | glass
     "glass": 90,
     "ui": 100,                 # 缩放百分比
     "cardw": 320, "cardh": 104,
-    "auto_resize": False,      # 导入图片时是否按比例改卡片尺寸
-    "auto_size": False,        # 按当前图片比例自动调整卡片另一维，贴三边且不裁
-    "img_fill": "cover",       # cover 贴三边（会裁） | fit 完整显示靠边对齐
-    "text_pct": 40,            # 文字区占比%：堆叠时是底部条高度，两列时是文字列宽度
-    "img_side": "left",        # 纵向布局时图片靠哪边：left | right | center
-    "img_file": "", "iw": 45, "iw_auto": True, "ix": 0, "iy": 0, "fade": 22,
+    # 图片在文字的哪一侧。含义随排法变：竖版是图在上 / 图在下，横版是图在左 /
+    # 图在右。图片没占满的那一维一律居中，不给选——靠一边不好看。
+    "img_side": "left",        # left = 图在上 / 图在左，right = 图在下 / 图在右
+    "img_file": "", "fade": 22,
+    "tint": False,             # 卡片配色跟随当前图片
+    "tint_amt": 14,            # 主色掺进底色的比例 %
     "slot_rows": 2,            # 倒计时最多占几行，多出来的不显示
+    "slot_each": False,        # 每条倒计时单独一行，不挤在一起
     "rotate_min": 0,           # 图片轮换间隔（分钟），0 = 不轮换
     "shuffle": True,           # 随机还是按文件名顺序
     "alttab": False,           # 是否出现在 Alt+Tab 列表里
@@ -284,6 +306,24 @@ def text_w(d, text, font):
     return total
 
 
+def ink_box(d, text, font):
+    """文字实际墨迹的包围盒 (左, 上, 右, 下)，相对绘制原点。
+
+    Pillow 的 text() 是按 em 框的原点画的，而不同字体的左边距和上下留白
+    差很多：Bahnschrift 的数字左边几乎没有空隙，微软雅黑的汉字自带一圈。
+    同一个 x 画出来，"0" 和 "距" 的左边缘就是对不齐的；同一套行距，
+    数字行和汉字行之间看着也忽大忽小。按墨迹框排就没这问题。
+    """
+    try:
+        b = font.getbbox(str(text))
+        if b and b[2] > b[0] and b[3] > b[1]:
+            return b[0], b[1], b[2], b[3]
+    except Exception:
+        pass
+    w = int(d.textlength(str(text), font=font))
+    return 0, 0, w, font.size
+
+
 def draw_text(d, xy, text, font, fill):
     """混排绘制：emoji 段走彩色字体，其余用传入的字体"""
     x, y = xy
@@ -382,6 +422,8 @@ def compute(cfg):
 
 
 # ============================ 渲染 ============================
+_FIT_WHY = [""]      # 自动加宽这一帧的结论，设置窗口把它显示出来
+_STACK = [False]     # 这一帧是不是竖版（图在上）。设置窗口拿它切「靠边」的措辞
 _CARD_CACHE = {}
 _NOISE_CACHE = {}
 _GIF_CACHE = {}
@@ -440,8 +482,7 @@ def load_frames(path, bw, bh, cfg, vertical=False, flip=False):
         mt = os.path.getmtime(path)
     except OSError:
         return [], [], 0
-    key = (path, mt, bw, bh, int(cfg.get("ix", 0)), int(cfg.get("iy", 0)),
-           int(cfg.get("fade", 45)), vertical, flip)
+    key = (path, mt, bw, bh, int(cfg.get("fade", 45)), vertical, flip)
     hit = _GIF_CACHE.get(key)
     if hit:
         return hit
@@ -466,28 +507,28 @@ def load_frames(path, bw, bh, cfg, vertical=False, flip=False):
 
 
 def place(src, bw, bh, cfg, vertical=False, flip=False):
-    """铺满目标框并居中裁切，偏移量用来挑裁哪一块。
-    横向布局在左缘淡出，纵向布局在下缘淡出。"""
-    ratio = max(bw / src.width, bh / src.height)
-    src = src.resize((max(1, int(src.width * ratio)),
-                      max(1, int(src.height * ratio))), Image.LANCZOS)
-    # cover 之后图片必定不小于容器，偏移量只能在"还盖得住"的范围内移动。
-    # 不夹住的话，残留的旧偏移会把图片推出画面，边上露出空白。
-    ox = (bw - src.width) // 2 + int(cfg.get("ix", 0))
-    oy = (bh - src.height) // 2 + int(cfg.get("iy", 0))
-    ox = max(min(ox, 0), bw - src.width)
-    oy = max(min(oy, 0), bh - src.height)
+    """把图片放进目标框。
+
+    目标框的宽高比是照着图片算出来的，所以这里等比缩放就正好填满，不裁。
+    取整会差一两像素，居中放，两边各分半个像素的误差。
+    淡出方向永远朝着文字那一侧，由 vertical / flip 两个参数定。
+    """
+    k = min(bw / src.width, bh / src.height)
+    src = src.resize((max(1, int(round(src.width * k))),
+                      max(1, int(round(src.height * k)))), Image.LANCZOS)
     out = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
-    out.paste(src, (ox, oy), src)
+    out.paste(src, ((bw - src.width) // 2, (bh - src.height) // 2), src)
 
     fade = max(0, min(100, int(cfg.get("fade", 45)))) / 100
     if fade > 0:
-        if vertical:                      # 图片在上方，往下淡出接住文字
+        if vertical:                      # 纵向：往文字那一侧淡出
             n = bh
             grad = Image.new("L", (1, n))
             span = max(1, n * fade)
             for i in range(n):
-                grad.putpixel((0, i), int(255 * min(1.0, (n - 1 - i) / span)))
+                # flip=True 表示图片在下方，文字在上，要往上淡出
+                t = i if flip else (n - 1 - i)
+                grad.putpixel((0, i), int(255 * min(1.0, t / span)))
         else:                             # 横向：往文字那一侧淡出
             n = bw
             grad = Image.new("L", (n, 1))
@@ -511,36 +552,212 @@ def clamp(v, lo, hi, dflt):
         return dflt
 
 
-def render(cfg, theme, clock_ms=0):
+_TINT_CACHE = {}
+
+
+def dominant_color(path):
+    """取图片主色。
+
+    降到 64px 再统计，按 24 一档粗量化把同色系归成一堆。跳过透明像素，
+    也跳过接近灰白和接近纯黑的颜色——表情包大多是白底加黑描边，不排除的话
+    取出来永远是白色或黑色，配色等于没变。
+    """
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return None
+    if key in _TINT_CACHE:
+        return _TINT_CACHE[key]
+    try:
+        with Image.open(path) as src:
+            src.seek(0)                       # 动图只看第一帧
+            im = src.convert("RGBA")
+            im.thumbnail((64, 64))
+            px = [q for q in im.getdata() if q[3] > 128]
+    except Exception:
+        return None
+    if not px:
+        return None
+    buckets = {}
+    for cr, cg, cb, _ in px:
+        k = (cr // 24, cg // 24, cb // 24)
+        acc = buckets.setdefault(k, [0, 0, 0, 0])
+        acc[0] += cr
+        acc[1] += cg
+        acc[2] += cb
+        acc[3] += 1
+    best, best_score = None, -1.0
+    fallback, fallback_n = None, -1
+    for acc in buckets.values():
+        n = acc[3]
+        cr, cg, cb = acc[0] // n, acc[1] // n, acc[2] // n
+        if n > fallback_n:
+            fallback, fallback_n = (cr, cg, cb), n
+        _, li, sa = colorsys.rgb_to_hls(cr / 255, cg / 255, cb / 255)
+        if sa < 0.18 or li < 0.12 or li > 0.92:
+            continue
+        score = n * (0.5 + sa)                # 面积为主，鲜艳度加权
+        if score > best_score:
+            best, best_score = (cr, cg, cb), score
+    out = best or fallback
+    if len(_TINT_CACHE) > 64:
+        _TINT_CACHE.clear()
+    _TINT_CACHE[key] = out
+    return out
+
+
+def fit_accent(rgb, dark):
+    """把主色调到在当前深浅底色上读得清的亮度和饱和度。
+    直接用原色的话，浅色卡片配上浅黄的图会得到一行看不见的字。"""
+    hu, li, sa = colorsys.rgb_to_hls(*[c / 255 for c in rgb])
+    sa = max(sa, 0.45)
+    li = max(li, 0.62) if dark else min(li, 0.42)
+    return tuple(int(c * 255) for c in colorsys.hls_to_rgb(hu, li, sa))
+
+
+def _lum(c):
+    """WCAG 相对亮度"""
+    out = []
+    for v in c[:3]:
+        v /= 255.0
+        out.append(v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2]
+
+
+def contrast(a, b):
+    la, lb = _lum(a), _lum(b)
+    if la < lb:
+        la, lb = lb, la
+    return (la + 0.05) / (lb + 0.05)
+
+
+def _hls(h, li, sa):
+    li = max(0.0, min(1.0, li))
+    return tuple(int(round(c * 255)) for c in colorsys.hls_to_rgb(h, li, sa))
+
+
+def ensure_cr(rgb, bg, need=TEXT_CR):
+    """把颜色推到相对底色至少 need 的对比度，保住色相和饱和度。
+
+    只动亮度，不往黑白里掺。掺白掺黑等于把配色洗掉一半——取色开着的意义
+    就是让卡片带上图片的颜色，为了看清先把颜色兑没了，那不如不取。
+    两个方向都试，先要变暗那一档（改动量小的优先），推到头仍然不够就取
+    对比度最高的那个端点——底色本身落在中间调时会走到这一步。
+    """
+    if contrast(rgb, bg) >= need:
+        return rgb
+    hu, li, sa = colorsys.rgb_to_hls(*[c / 255.0 for c in rgb])
+    best, best_cr = rgb, contrast(rgb, bg)
+    for target in (0.0, 1.0):
+        lo, hi, hit = 0.0, 1.0, None
+        for _ in range(14):
+            mid = (lo + hi) / 2
+            cand = _hls(hu, li + (target - li) * mid, sa)
+            if contrast(cand, bg) >= need:
+                hit, hi = cand, mid
+            else:
+                lo = mid
+        if hit is not None:
+            return hit
+        end = _hls(hu, target, sa)
+        if contrast(end, bg) > best_cr:
+            best, best_cr = end, contrast(end, bg)
+    return best
+
+
+ROW_KEYS = ("big", "cap", "mon", "slot")
+ALIGNS = ("left", "center", "right")
+
+
+def row_plan(cfg):
+    """返回 [(行键, 对齐)]。缺的补齐、重复的丢掉、非法值退回默认——
+    配置是用户可以手改的文件，渲染里不能假设它一定合法。"""
+    out, seen = [], set()
+    for it in cfg.get("rows") or []:
+        k = (it or {}).get("k")
+        if k in ROW_KEYS and k not in seen:
+            a = (it or {}).get("align", "left")
+            out.append((k, a if a in ALIGNS else "left"))
+            seen.add(k)
+    for k in ROW_KEYS:
+        if k not in seen:
+            out.append((k, "left"))
+    return out
+
+
+def render(cfg, theme, clock_ms=0, rects=None):
     scale = max(0.75, min(1.5, float(cfg.get("ui", 100)) / 100))
     W = int(clamp(cfg.get("cardw", 320), W_MIN, W_MAX, 320) * scale)
     H = int(clamp(cfg.get("cardh", 104), H_MIN, H_MAX, 104) * scale)
     r = int(RADIUS * scale)
     pad = int(18 * scale)
 
+    # 手动微调倍率。字号仍然先按文字区高度自动推一遍，再乘这些系数，
+    # 之后照样走收缩流程——所以调过头也只是被压回来，不会溢出卡片。
+    # 字号微调和行距以前是五个滑块。排版是算出来的，算得好就不需要手调，
+    # 算得不好该改算法。留成常量，公式里那些乘法原样保留，改起来只动这一行。
+    fs_big = fs_cap = fs_mon = fs_slot = gp = 1.0
+
     dark = theme["dark"] if cfg["bg"] in ("auto", "glass") else (cfg["bg"] == "dark")
     glass = cfg["bg"] == "glass"
     accent = theme["accent"]
 
+    # 配色跟随当前图片：强调色直接换成图片主色，底色掺一点点进去。
+    # 底色只掺一小撮就够——掺多了卡片会变成一块彩色板，文字对比度掉得厉害。
+    tint = None
+    if cfg.get("tint") and cfg.get("img_file"):
+        _tp = os.path.join(IMGDIR, cfg["img_file"])
+        if os.path.exists(_tp):
+            tint = dominant_color(_tp)
+    if tint:
+        accent = fit_accent(tint, dark)
+    amt = (clamp(cfg.get("tint_amt", 14), 0, 40, 14) / 100) if tint else 0
+
+    def _tinted(c):
+        if not amt:
+            return c
+        return tuple(int(x * (1 - amt) + y * amt) for x, y in zip(c, tint))
+
     if glass:
         # 下限不能是 0：分层窗口里 alpha=0 的像素鼠标是穿透的，
-        # 全透明就等于整张卡点不中，既拖不动也打不开设置。
-        a = max(14, min(230, int(cfg.get("glass", 90))))
-        base = (26, 26, 26, a) if dark else (242, 242, 242, a)
+        # 全透明就等于整张卡点不中，既拖不动也打不开设置。1 就够了，
+        # 底色几乎看不见但像素仍然可命中；文字本来就是不透明画的，照样清楚。
+        a = max(1, min(255, int(cfg.get("glass", 90))))
+        base = _tinted((26, 26, 26) if dark else (242, 242, 242)) + (a,)
     else:
-        base = (25, 28, 33, 255) if dark else (255, 255, 255, 255)
+        base = _tinted((25, 28, 33) if dark else (255, 255, 255)) + (255,)
 
     # 文字必须完全不透明。"变灰"靠往底色方向混合，不能靠降 alpha——
     # 在半透明卡片上降 alpha 等于让桌面直接透过文字。
     fg_rgb = (255, 255, 255) if dark else (16, 18, 22)
+    if tint:
+        # 主文字也掺一点主色。只给次要文字上色的话，时分是纯黑、秒和说明
+        # 却带着颜色，看着像只做了一半。主文字掺得轻，18% 够了——
+        # 掺重了时钟会变成一坨彩色，可读性掉得厉害。
+        fg_rgb = tuple(int(x * 0.82 + y * 0.18) for x, y in zip(fg_rgb, accent))
     fg = fg_rgb + (255,)
     fg2 = tuple(int(x * 0.55 + y * 0.45) for x, y in zip(fg_rgb, base[:3])) + (255,)
+    if tint:
+        # 说明和倒计时那两行也往主色偏一点。文字是完全不透明画的，
+        # 所以这条路径不受玻璃浓度影响，透明卡片上照样看得出配色。
+        fg2 = tuple(int(x * 0.62 + y * 0.38)
+                    for x, y in zip(fg2[:3], accent)) + (255,)
+    # 上面那几个混合比例是按"好看"调的，没有一处保证读得清。这里统一兜一次底：
+    # 达标就原样放行（绝大多数情况），不达标才推亮度。放在最后做，所以不管前面
+    # 怎么混、混几层，出口只有这一个。
+    # 毛玻璃下底色是半透明的，真正的背景是桌面，量不到；仍然按 base 算——
+    # 卡片本来就是照着 base 配色的，这是能拿到的最好参照。
+    fg2 = ensure_cr(fg2[:3], base[:3]) + (255,)
+    accent = ensure_cr(accent, base[:3])     # 金额用的就是它
 
     im, shape = card_shape(W, H, r, base)
     probe = ImageDraw.Draw(im)
 
+    plan = row_plan(cfg)
     big, sec, cap, money, parts = compute(cfg)
     show_money = bool(cfg.get("show_money", True))
+    if not cfg.get("show_cap", True):
+        cap = ""
     sym = str(cfg.get("cur_sym", "¥"))
     # 金额数字走 consola / courier 等宽体——它每秒都在变，不等宽会左右抖。
     # 但这两个字体只覆盖西文和少数几个货币符号，₩ ₽ ₹ 元 都没有，画出来
@@ -604,111 +821,85 @@ def render(cfg, theme, clock_ms=0):
         except Exception:
             has_img = False
 
-    # ---------- 布局：宽卡片图片贴右侧，方卡片图片放上方 ----------
-    # 卡片一变窄，"文字左图片右"就挤不下了，得改成上下堆叠。
-    # 自动尺寸：固定用户设的一个维度，另一维按图片比例反推，
-    # 让图片刚好贴满三边又不裁切。不写回配置，换图后自己会重算。
-    if has_img and cfg.get("auto_size"):
-        # 两种填充模式都要支持。之前限定只在 cover 下生效，
-        # 结果配置里是 fit 的用户按了开关完全没反应。
-        tp = clamp(cfg.get("text_pct", 40), 25, 65, 40) / 100
-        if ratio >= 0.95:                       # 横图：宽度不动，算高度
-            need = (W / ratio) / (1 - tp)
-            if need > H_MAX * scale:
-                # 算出来超过高度上限，反过来收窄卡片，比硬裁一半强
-                W = int(clamp(H_MAX * ratio * (1 - tp), W_MIN, W_MAX, 320) * scale)
-                need = (W / ratio) / (1 - tp)
-            H = int(clamp(need / scale, H_MIN, H_MAX, 104) * scale)
-            # 小图别硬撑大：放大超过 2 倍就糊，按原始分辨率封顶
-            # 注意变量名：cap 是上面 compute() 返回的说明文字，别在这里复用！
-            cap_px = int(src_w * 2 * scale)
-            if src_w and W > cap_px:
-                W = int(clamp(cap_px / scale, W_MIN, W_MAX, 320) * scale)
-                H = int(clamp((W / ratio) / (1 - tp) / scale, H_MIN, H_MAX, 104) * scale)
-        else:                                   # 竖图：高度不动，算宽度
-            need = (H * ratio) / (1 - tp)
-            if need > W_MAX * scale:
-                H = int(clamp(W_MAX / ratio * (1 - tp), H_MIN, H_MAX, 104) * scale)
-                need = (H * ratio) / (1 - tp)
-            W = int(clamp(need / scale, W_MIN, W_MAX, 320) * scale)
-            cap_px = int(src_h * 2 * scale)
-            if src_h and H > cap_px:
-                H = int(clamp(cap_px / scale, H_MIN, H_MAX, 104) * scale)
-                W = int(clamp((H * ratio) / (1 - tp) / scale, W_MIN, W_MAX, 320) * scale)
-        im, shape = card_shape(W, H, r, base)
-        probe = ImageDraw.Draw(im)
+    if rects is not None:
+        # 卡片自身的尺寸，播种自由排版时拿它换算比例
+        rects.append(("_card", 0, 0, W, H, 0))
 
-    # 布局按图片方向定，不按卡片形状：竖构图天然适合和文字并排成两列，
-    # 堆叠会把文字挤成上下两块，读起来是断的。只有横图和方图才堆叠。
-    stack = has_img and (W / max(1, H)) < 1.55 and ratio >= 0.95
-    use_L = False
-    ax = aw = ay = ah = 0
+    # ---------- 布局 ----------
+    # 图片带的宽高比 == 图片本身的宽高比，所以永远等比放得下，不裁。
+    # 两种摆法各算一遍，谁能把图片放得更大就用谁：
+    #   两列（图在侧）图片高 = 卡片高，宽 = 卡片高 x 比例
+    #   堆叠（图在上）图片宽 = 卡片宽，高 = 卡片宽 / 比例
+    # 竖图自然落到两列，横图自然落到堆叠，不需要"卡片宽高比小于 1.55"这种魔数。
+    #
+    # 「文字区最少占比」是保险：图片按比例算出来太大时把它压回去，
+    # 保证文字永远有地方待。平时不起作用。
+    #
+    # 剩下的宽度（或高度）全部归文字，不再按占比对半切——图片只拿它需要的。
+    stack = False
+    _STACK[0] = False  # 设置窗口拿它切措辞，无图时也得更新，不能留上一次的值
+    img_fix = 0        # 两列布局下由图片比例定死的带宽，跟卡片宽度无关。加宽时要用
     bw = bh = bx = by = 0
     tx, ty, tw, th = pad, 0, W - pad * 2, H          # 文字区
+    gap = int(9 * scale)                             # 图片和文字之间的小缝
 
-    if has_img and not stack:
-        need = max(
-            text_w(probe, big, F_NUM(int(20 * scale)))
-            + (text_w(probe, " " + sec, F_NUM(int(10 * scale))) if sec else 0),
-            text_w(probe, cap, F_TXT(int(11 * scale))),
-        ) * 1.6                                      # 粗估，字号还没定
-        room = W - int(need) - pad - int(10 * scale)
-        if cfg.get("iw_auto", True):
-            # cover 只在"条的宽高比 == 图片比例"时才不裁，
-            # 所以宽度直接算成 卡片高 × 图片比例。
-            bw = max(int(W * 0.2), min(int(W * 0.72), room, int(H * ratio)))
+    if has_img:
+        room = IMG_MAX                                     # 图片最多占
+        # 小图照样撑满，糊就糊。之前封在原始分辨率的 2 倍，结果一张 60px 的
+        # 表情包在 340 高的卡片里只占 150，旁边空一大块——为了图片清楚牺牲版面，
+        # 换来的是一张丑卡。取舍是：字要看清，图能看出是什么就行。
+        img_fix = max(1, int(H * ratio))                   # 只由图片和卡片高决定
+        cw = max(1, min(img_fix, int(W * room)))           # 两列：贴上下，宽受限
+        ch = max(1, min(H, int(cw / max(0.05, ratio))))
+        cw = max(1, min(cw, int(ch * ratio)))
+
+        # 堆叠 + 自动加高时，高度已经是照着"图片铺满整宽 + 文字够用"算出来的，
+        # 「文字区最少占比」那道保险再压一次就会把图片从 300 压回 288，白白
+        # 差一口气铺不满。这时候只留一条底线：文字至少还有四分之一。
+        room_s = max(room, 0.75) if True else room
+        sh = max(1, min(int(W / max(0.05, ratio)), int(H * room_s)))  # 堆叠：贴左右
+        sw = max(1, min(W, int(sh * ratio)))
+        sh = max(1, min(sh, int(sw / max(0.05, ratio))))
+
+        # 判据就是卡片形状：你把卡片设成什么样，就用哪种排法。
+        #   宽 > 高  -> 图在左、字在右，不够宽就把卡片加宽
+        #   高 >= 宽 -> 图在上、字在下，不够高就把卡片加高
+        # 之前试过三版自动判据（谁让图片大 / 按图片朝向 / 谁让主时间大），
+        # 每一版都在某类图上翻车，而且用户看不出它凭什么这么选。形状是用户
+        # 自己定的，两种排法现在都能靠加宽或加高把文字撑开，那就交回给用户。
+        # 用**你设的**尺寸判，不能用加宽加高之后算出来的：横版加宽会让 W 变大、
+        # 竖版加高会让 H 变大，拿新值再判一次就会把自己判进另一种排法，然后
+        # 越长越长。360x300 设的是横版，加高后变成 300x592 的长条就是这么来的。
+        base_w = clamp(cfg.get("_fit_base", cfg.get("cardw", 320)),
+                       W_MIN, W_MAX, 320)
+        base_h0 = clamp(cfg.get("_fit_base_h", cfg.get("cardh", 104)),
+                        H_MIN, H_MAX, 104)
+        stack = base_h0 >= base_w
+        _STACK[0] = stack
+        # 「图片位置」管的是图片在文字的哪一侧：竖版图在上 / 图在下，
+        # 横版图在左 / 图在右。图片没占满的那一维一律居中。
+        to_end = cfg.get("img_side", "left") == "right"
+        if stack:
+            bw, bh = sw, sh
+            bx = (W - bw) // 2                       # 横着没占满就居中
+            if to_end:                               # 图在下，文字在上
+                by = H - bh
+                ty, th = 0, H - bh - gap
+            else:                                    # 图在上，文字在下
+                by = 0
+                ty, th = bh + gap, H - bh - gap
+            tw = W - pad * 2
         else:
-            bw = int(W * clamp(cfg.get("iw", 45), 20, 70, 45) / 100)
-            bw = min(bw, max(int(W * 0.2), room))
-        if cfg.get("img_fill", "cover") == "cover":
-            # 文字列占多少由滑块定，剩下全给图片，图片贴住上下和一侧三条边
-            tpct = clamp(cfg.get("text_pct", 40), 25, 65, 40) / 100
-            bw = W - int(W * tpct)
-            bh, by = H, 0
-        else:
-            # 完整显示模式下也让文字区占比生效，否则这个滑块只在贴三边时有用
-            tpct = clamp(cfg.get("text_pct", 40), 25, 65, 40) / 100
-            bw = min(bw, W - int(W * tpct))
-            bh = min(H, max(1, int(bw / max(0.05, ratio))))
-            by = 0                             # 完整显示时贴上边，留白留在下方
-        # 靠边方向对两列布局同样生效，之前只在堆叠布局里用了
-        gap = int(9 * scale)                   # 贴着图片那侧只留小缝
-        if cfg.get("img_side", "left") == "left":
-            bx, tx = 0, bw + gap
+            bw, bh = cw, ch
+            by = (H - bh) // 2                       # 竖着没占满就居中
+            if to_end:                               # 图在右，文字在左
+                bx, tx = W - bw, pad
+            else:                                    # 图在左，文字在右
+                bx, tx = 0, bw + gap
             tw = W - bw - gap - pad
-        else:
-            bx, tx = W - bw, pad
-            tw = W - bw - gap - pad
-    elif stack:
-        # 图片占上方。底部文字条留多少由「文字区占比」定。
-        tpct = clamp(cfg.get("text_pct", 40), 25, 65, 40) / 100
-        if cfg.get("img_fill", "cover") == "cover":
-            bh = H - int(H * tpct)             # 贴满左右和上边，多余的裁掉
-            bw, bx = W, 0
-        else:
-            # 完整显示：图片不超过占比留给它的高度，靠角对齐不居中
-            bh = min(H - int(H * tpct),
-                     max(int(H * 0.25), int(W / max(0.05, ratio))))
-            bw = min(W, max(1, int(bh * ratio)))
-            side = cfg.get("img_side", "left")
-            bx = 0 if side == "left" else (W - bw if side == "right"
-                                           else (W - bw) // 2)
-        by = 0                                 # 始终贴顶边
-        ty, th = bh, H - bh                    # 文字区紧贴图片下沿
-        tw = W - pad * 2
-        # 图片没占满宽度时，旁边那块空白别浪费，主时间挪进去（L 形布局）
-        side_w = W - bw
-        flush = (bx == 0) or (bx + bw >= W)     # 图片必须贴住某一侧
-        # 阈值要保证塞进去的字还像样，否则不如老实放下方。
-        # 居中的图片两边各有一半空白，没有连续可用区域，直接不走 L 形。
-        if cfg.get("img_fill", "cover") == "cover":
-            pass                               # cover 下文字本来就独占一条，不需要 L 形
-        elif flush and side_w >= max(int(112 * scale), int(W * 0.32)):
-            use_L = True
-            ax = pad if bx > 0 else bw + pad    # 图片靠右则文字在左，反之在右
-            aw = side_w - pad * 2
-            ay, ah = 0, bh
-            ty, th = bh, H - bh
+
+    if rects is not None:
+        rects.append(("_text", tx, ty, tw, th, 0))   # 文字区，自由排版的坐标基准
 
     # ---------- 字号：按文字区高度和行数反推 ----------
     # 无图 + 接近正方形时也走竖排。两列布局会把内容压成中间一小块，
@@ -718,38 +909,199 @@ def render(cfg, theme, clock_ms=0):
     # 本质还是两行。够高就改成竖排四行，每行各占一档，才算真正铺开。
     stack_tall = stack and th >= int(112 * scale)
     single = (has_img and not stack) or tall_empty or stack_tall
-    if use_L:
-        # 主时间独占侧边那块，按它的高度算；下方只放收入和倒计时
-        big_sz = max(18, min(52, (ah / scale) / 2.1))
-        if has_cjk(big):
-            big_sz *= 0.72
-        mon_sz = max(12, min(30, (th / scale) / (2.0 if show_money else 3.0)))
-        cap_sz = max(9, min(15, big_sz * 0.30))
-        f_big = (F_TXT if has_cjk(big) else F_NUM)(int(big_sz * scale))
-        f_sec = F_NUM(int(big_sz * 0.45 * scale))
-        f_cap = F_TXT(int(cap_sz * scale))
-        f_mon = F_MON(int(mon_sz * scale))
-        # 秒数画在主时间右边，必须算进总宽。只测主时间的话，
-        # 加上秒数就会顶出侧边区域压到图片上。
-        def _line_w():
-            w = text_w(probe, big, f_big)
-            if sec:
-                w += int(5 * scale) + text_w(probe, sec, f_sec)
-            return w
-        while _line_w() > aw and big_sz > 12:
-            big_sz -= 1
-            f_big = (F_TXT if has_cjk(big) else F_NUM)(int(big_sz * scale))
-            f_sec = F_NUM(int(big_sz * 0.45 * scale))
-            cap_sz = max(9, min(15, big_sz * 0.30))
-            f_cap = F_TXT(int(cap_sz * scale))
-        avail = th / scale
-    else:
-        avail = th / scale - (14 if stack else 24)
-        if tall_empty:
-            avail = th / scale - 20
-    if use_L:
-        pass
-    elif single:
+    # 竖版一律走左右分栏（主时间+说明在左上，倒计时+金额在右下）；
+    # 横版保持原样，由文字区高度在竖排单列和两行两列之间自动选。
+    # 布局以前是个四选一的下拉，可"排得好不好看"该由算法负责，不该甩给用户。
+    split = stack and tw > int(150 * scale)
+
+    # ---------- 按文字反推卡片宽度 ----------
+    # 字号是被文字列的宽度卡住的：列一窄，主时间放大到顶宽就停了，高度上剩多少
+    # 都用不掉，只能摊成行距和上下留白。这里反过来算——先二分出高度能容下多大
+    # 的字，再看那个字号下最宽的一行要多宽，不够就把卡片加宽，然后整个重画一遍。
+    #
+    # 放在这里是有讲究的：再往下就该合成图片了，那一步对动图是逐帧解码加缩放，
+    # 重画一遍等于把整张 GIF 再处理一次。放在合成之前，重来的只是这段几何计算。
+    #
+    # 只在竖排单列下生效。两行两列那种同一行里左右两块字互相抢宽度，
+    # 高度模型完全是另一套，套过来算出来的宽度没有意义。
+    #
+    # 图片在上（堆叠）时不做：那种布局下文字列本来就是整张卡宽，加宽只会把
+    # 图片一起放大，越加越糟。
+    if not cfg.get("_fit_pass"):
+        if not True:
+            _FIT_WHY[0] = ""
+        elif not single and not stack:
+            _FIT_WHY[0] = ("没加宽：当前是两行两列布局，"
+                           "同一行里左右两块字互抢宽度，不适用")
+    if os.environ.get("OFFWORK_DEBUG") and True:
+        print("[fit] 开关=on single=%s stack=%s pass=%s"
+              % (single, stack, cfg.get("_fit_pass", 0)))
+    # ---------- 两条加宽/加高共用的估算器 ----------
+    vis_k = [k for k, _a in plan
+             if k == "big" or (k == "cap" and cap)
+             or (k == "mon" and show_money) or (k == "slot" and parts)]
+    guard0 = int(8 * scale) * 2
+    n_slot = min(len(parts), int(clamp(cfg.get("slot_rows", 2), 1, SLOT_MAX, 2))) \
+        if cfg.get("slot_each") else 1
+
+    def _wide(t):
+        """测宽用的替身：数字一律换成 8。
+
+        秒数每秒变一次，字形宽度差一两像素，算出来的卡片宽度就跟着抖；
+        宽度一抖，动图逐帧缓存的键跟着变，整张 GIF 每秒重新解码一遍——
+        表现就是尺寸一卡一卡地跳。按最宽的数字量，结果就恒定了。
+        """
+        return "".join("8" if ch.isdigit() else ch for ch in str(t))
+
+    def _need(pb):
+        """给定主字号，返回 (块高, 最宽的一行要多宽)。
+
+        倒计时不勾「每条单独一行」时按一行算：加宽之后本来就该收成一行，
+        这个假设跟结果是自洽的。宽度取单条的最大值——再宽的列也不会把
+        「发薪 13 天」这样一条拆开，它就是宽度的下限。
+        """
+        bsz = pb / (scale * max(0.01, fs_big))
+        csz = max(9, min(24, bsz * 0.30))
+        c_ = max(1, int(csz * scale * fs_cap))
+        m_ = max(1, int(bsz * 0.52 * scale * fs_mon))
+        r_ = max(8, int(csz * scale * fs_slot))
+        fb = (F_TXT if has_cjk(big) else F_NUM)(pb)
+        fsc = F_NUM(max(8, int(pb * 0.45)))
+        hs, ws = [], []
+        for k in vis_k:
+            if k == "big":
+                hs.append(pb)
+                ws.append(text_w(probe, _wide(big), fb) + (
+                    (int(6 * scale) + text_w(probe, _wide(sec), fsc))
+                    if sec else 0))
+            elif k == "cap":
+                hs.append(c_)
+                ws.append(text_w(probe, _wide(cap), F_TXT(c_)))
+            elif k == "mon":
+                hs.append(m_)
+                fm2 = F_MON(m_)
+                ws.append(text_w(probe, sym, _f_sym(fm2)) + _sym_gap(fm2)
+                          + text_w(probe, _wide(money), fm2))
+            else:
+                fr = F_TXT(r_)
+                hs.append(r_ * n_slot
+                          + max(2, int(r_ * 0.5 * gp)) * (n_slot - 1))
+                ws.append(max([text_w(probe, _wide(t), fr) for t in parts], default=0))
+        g = max(2, int(c_ * 1.15 * gp))
+        return sum(hs) + g * max(0, len(hs) - 1), max(ws or [0])
+
+    def _wr_big():
+        """主时间每 1px 字号占多少宽。反过来由宽度推字号时要用。"""
+        ref = 100
+        f = (F_TXT if has_cjk(big) else F_NUM)(ref)
+        w = text_w(probe, _wide(big), f)
+        if sec:
+            w += int(6 * scale) + text_w(probe, _wide(sec), F_NUM(int(ref * 0.45)))
+        return max(1.0, w) / ref
+
+    # 堆叠这一半：图片铺满整个卡片宽度（顶满上左右三边），底部把卡片拉长放文字。
+    # 加高不会改变图片大小——堆叠下图片宽 = 卡片宽、高 = 宽 / 比例，跟卡片高度
+    # 无关，所以这条路没有"越长越要长"的回环。
+    #
+    # 目标跟横版那条路对称：横版是"加宽到文字不再嫌挤"，竖版就该是"加高到文字
+    # 不再嫌矮"。之前写成"长到文字区正好等于最少占比"——那是下限不是舒服的尺寸，
+    # 表现就是自动出来的字比手动拉一下还小。
+    if (stack and has_img and True
+            and int(cfg.get("_fit_pass", 0)) < 3):
+        sh_full = max(1, int(W / max(0.05, ratio)))     # 铺满整宽时图片该多高
+        base_h = clamp(cfg.get("_fit_base_h", cfg.get("cardh", 104)),
+                       H_MIN, H_MAX, 104) * scale
+        # 宽度能容下多大的主时间——堆叠下文字列就是整张卡宽，这个值不会变
+        pb_w = int(max(12, (W - pad * 2) / _wr_big()))
+        blk = _need(pb_w)[0]
+        # 两条约束取严的：装得下所有行，且主时间不超过文字区高度的 BIG_MAX
+        need_th = max(blk + guard0, int(pb_w / BIG_MAX))
+        want_h = (int(sh_full + gap + need_th) + 7) // 8 * 8
+        want_h = min(want_h, int(H_MAX * scale), int(base_h * FIT_GROW_H))
+        if not cfg.get("_fit_pass"):
+            _FIT_WHY[0] = ("已加高到 %dx%d（设定高度 %d）" % (W, want_h, int(base_h))
+                           if want_h > H + 2 else
+                           "没加高：图片已经铺满整宽，文字也放得下")
+        if want_h > H + 2:
+            c2 = dict(cfg)
+            c2["cardh"] = int(want_h / scale)
+            c2["_fit_base_h"] = cfg.get("_fit_base_h", cfg.get("cardh", 104))
+            c2["_fit_pass"] = int(cfg.get("_fit_pass", 0)) + 1
+            if rects is not None:
+                del rects[:]
+            return render(c2, theme, clock_ms, rects)
+
+    if (single and not stack and True
+            and int(cfg.get("_fit_pass", 0)) < 3 and tw > 0 and th > 0):
+        lo3, hi3 = 12, max(13, int(th * BIG_MAX))
+        while hi3 - lo3 > 1:
+            mid = (lo3 + hi3) // 2
+            if _need(mid)[0] <= th - guard0:
+                lo3 = mid
+            else:
+                hi3 = mid
+        need_w = _need(lo3)[1]
+        if need_w <= tw + 2 and not cfg.get("_fit_pass"):
+            _FIT_WHY[0] = ("没加宽：文字没被宽度卡住（文字列 %d，只需要 %d，"
+                           "字号是被高度决定的）" % (tw, need_w))
+        if os.environ.get("OFFWORK_DEBUG"):
+            print("[fit] 文字列宽 tw=%d 需要 %d（高度能容下的主字号 %d）-> %s"
+                  % (tw, need_w, lo3,
+                     "加宽" if need_w > tw + 2 else "已经够宽，不动"))
+        if need_w > tw + 2:
+            # 直接解出需要多宽，不要拿斜率去推。
+            #   文字列 = 卡片宽 - 图片带 - 固定开销(缝隙+内边距)
+            #   图片带 = min(卡片宽 x (1-文字区占比), 封顶值)
+            # 是分段线性的：图片带封顶之后，加出来的宽度全归文字列，这时还按
+            # 占比折算就会多加一倍还多——卡片一路撞到上限，右边空一大条。
+            # 文字列 = W - min(图片带定值, W x 图片最多占) - 固定开销，分段线性。
+            # 两段各解一次，再验证解出来的宽度**自己**落在哪一段——不能拿当前
+            # 宽度去判断走哪一段：眼下图片带还顶着占比线，等加宽完它早就由比例
+            # 定死了，按占比那一段解出来会多加两百像素，右边空一大条。
+            c_pad = max(0, W - bw - tw)
+            tpct_ = 1 - IMG_MAX
+            room_ = 1 - tpct_
+            if not has_img:
+                want = W + (need_w - tw)
+            else:
+                w_fix = need_w + img_fix + c_pad          # 图片带定死那一段
+                w_pct = (need_w + c_pad) / max(0.15, tpct_)   # 顶着占比线那一段
+                if img_fix and img_fix <= w_fix * room_:
+                    want = w_fix
+                elif img_fix > w_pct * room_:
+                    want = w_pct
+                else:
+                    want = min(w_fix, w_pct)
+            # 上限按"用户自己设的那个宽度"算，不是按上一轮加宽后的宽度——
+            # 后者是自己乘自己，几轮下来还是没有边界。
+            base = clamp(cfg.get("_fit_base", cfg.get("cardw", 320)),
+                         W_MIN, W_MAX, 320) * scale
+            newW = int(want)
+            newW = (newW + 7) // 8 * 8          # 按 8 像素对齐，零头也别让它抖
+            newW = min(newW, int(W_MAX * scale), int(base * FIT_GROW))
+            if newW <= W + 2:
+                if not cfg.get("_fit_pass"):
+                    _FIT_WHY[0] = ("没加宽：已经到上限了（设定 %d，最多 %d）"
+                                   % (int(base), min(int(W_MAX * scale),
+                                                     int(base * FIT_GROW))))
+            else:
+                c2 = dict(cfg)
+                c2["cardw"] = int(newW / scale)
+                c2["_fit_base"] = cfg.get("_fit_base", cfg.get("cardw", 320))
+                c2["_fit_pass"] = int(cfg.get("_fit_pass", 0)) + 1
+                if rects is not None:
+                    del rects[:]           # 这一遍记的坐标作废，重画的那遍会重记
+                out = render(c2, theme, clock_ms, rects)
+                if not cfg.get("_fit_pass"):
+                    # 报最终尺寸，不是这一轮想要的尺寸——重画那一遍还可能再调一次。
+                    _FIT_WHY[0] = ("已加宽到 %dx%d（设定宽度 %d）"
+                                   % (out.size[0], out.size[1], int(base)))
+                return out
+
+    avail = th / scale - (14 if stack else 24)
+    if tall_empty:
+        avail = th / scale - 20
+    if single:
         # 上限跟着可用高度走。写死 44 的话，250px 高的卡片主时间才 34px，
         # 跟卡片完全不成比例。
         hi_m, hi_n = (72, 88) if tall_empty else (64, 80)
@@ -758,47 +1110,50 @@ def render(cfg, theme, clock_ms=0):
     else:
         big_sz = (max(20, min(52, avail / 2.2)) if show_money
                   else max(20, min(58, avail / 1.7)))
-    if not use_L:
-        if has_cjk(big):
-            big_sz *= 0.72    # 中文方块字比窄体数字宽得多，压一点才放得下
+    # 上下都要夹。只夹放大那一头不够——隐藏了金额和说明时公式本身就会算出
+    # 超过这条线的初值，卡片跟着被撑成广告牌。
+    big_sz = max(14, min(big_sz, th / scale * BIG_MAX))
+    if has_cjk(big):
+        big_sz *= 0.72        # 中文方块字比窄体数字宽得多，压一点才放得下
+    mon_sz = big_sz * (0.52 if single else 0.58)
+    cap_sz = max(9, min(24, big_sz * 0.30))
+
+    f_big = (F_TXT if has_cjk(big) else F_NUM)(int(big_sz * scale * fs_big))
+    f_sec = F_NUM(int(big_sz * 0.45 * scale * fs_big))
+    f_cap = F_TXT(int(cap_sz * scale * fs_cap))
+    f_mon = F_MON(int(mon_sz * scale * fs_mon))
+
+    # 主字太宽就缩，窄卡片下很容易顶出去。秒数也要算进去。
+    def _line_w2():
+        w = text_w(probe, big, f_big)
+        if sec:
+            w += int(6 * scale) + text_w(probe, sec, f_sec)
+        return w
+    while _line_w2() > tw and big_sz > 14:
+        big_sz -= 1
+        f_big = (F_TXT if has_cjk(big) else F_NUM)(int(big_sz * scale * fs_big))
+        f_sec = F_NUM(int(big_sz * 0.45 * scale * fs_big))
+        # 金额和说明是按 big_sz 的比例定的，主字缩了它们必须跟着缩。
+        # 之前只改 f_big / f_sec，f_mon 一直停在收缩前那一档，
+        # 窄文字列里就会直接画出卡片边框（"¥257." 被截断）。
         mon_sz = big_sz * (0.52 if single else 0.58)
-        cap_sz = max(9, min(15, big_sz * 0.30))
+        cap_sz = max(9, min(24, big_sz * 0.30))
+        f_mon = F_MON(int(mon_sz * scale * fs_mon))
+        f_cap = F_TXT(int(cap_sz * scale * fs_cap))
 
-        f_big = (F_TXT if has_cjk(big) else F_NUM)(int(big_sz * scale))
-        f_sec = F_NUM(int(big_sz * 0.45 * scale))
-        f_cap = F_TXT(int(cap_sz * scale))
-        f_mon = F_MON(int(mon_sz * scale))
-
-        # 主字太宽就缩，窄卡片下很容易顶出去。秒数也要算进去。
-        def _line_w2():
-            w = text_w(probe, big, f_big)
-            if sec:
-                w += int(6 * scale) + text_w(probe, sec, f_sec)
-            return w
-        while _line_w2() > tw and big_sz > 14:
-            big_sz -= 1
-            f_big = (F_TXT if has_cjk(big) else F_NUM)(int(big_sz * scale))
-            f_sec = F_NUM(int(big_sz * 0.45 * scale))
-            # 金额和说明是按 big_sz 的比例定的，主字缩了它们必须跟着缩。
-            # 之前只改 f_big / f_sec，f_mon 一直停在收缩前那一档，
-            # 窄文字列里就会直接画出卡片边框（"¥257." 被截断）。
-            mon_sz = big_sz * (0.52 if single else 0.58)
-            cap_sz = max(9, min(15, big_sz * 0.30))
-            f_mon = F_MON(int(mon_sz * scale))
-            f_cap = F_TXT(int(cap_sz * scale))
-
-        # 金额本身也要按宽度校验一次：它的字号是从主字高度推出来的，
-        # 从来没量过自己有多宽，纯数字位数一多照样出框。
-        if show_money:
-            room_m = (W - pad * 2) if use_L else tw
-            while money_w(probe, f_mon) > room_m and f_mon.size > 9:
-                f_mon = F_MON(f_mon.size - 1)
+    # 金额本身也要按宽度校验一次：它的字号是从主字高度推出来的，
+    # 从来没量过自己有多宽，纯数字位数一多照样出框。
+    if show_money:
+        while money_w(probe, f_mon) > tw and f_mon.size > 9:
+            f_mon = F_MON(f_mon.size - 1)
 
     # ---------- 画图片 ----------
     if has_img and bw > 0:
         try:
-            frames, durs, total = load_frames(path, bw, bh, cfg,
-                                              vertical=stack, flip=(bx == 0))
+            # 淡出朝文字那一侧：竖版图在下时往上淡，横版图在左时往右淡
+            frames, durs, total = load_frames(
+                path, bw, bh, cfg, vertical=stack,
+                flip=(to_end if stack else (bx == 0)))
             if not frames:
                 raise ValueError("no frames")
             if len(frames) > 1 and total:            # 动图：按累计时长挑当前帧
@@ -821,6 +1176,9 @@ def render(cfg, theme, clock_ms=0):
     im = Image.alpha_composite(im, noise_layer(W, H, shape))
     d = ImageDraw.Draw(im)
 
+    # ---------- 自由排版 ----------
+    # 一切相对文字区（tx/ty/tw/th），不是相对整张卡片。锚点定位置、
+    # 轴心定"用自己的哪条边去贴"，所以换图后文字区怎么变形都不会跑出框。
     # ---------- 倒计时折行 ----------
     def shrink(text, size, maxw, floor=8):
         sz = size
@@ -832,6 +1190,8 @@ def render(cfg, theme, clock_ms=0):
         return F_TXT(int(floor))
 
     def wrap(items, font, maxw):
+        if cfg.get("slot_each"):
+            return list(items)          # 每条一行，不拼在一起
         lines, cur = [], ""
         for it in items:
             cand = (cur + " · " + it) if cur else it
@@ -844,48 +1204,215 @@ def render(cfg, theme, clock_ms=0):
             lines.append(cur)
         return lines
 
-    room_r = aw if use_L else (tw if single else max(60, min(int(tw * 0.62), tw)))
-    if use_L:
-        room_r = tw
+    # ---------- 左右分栏 ----------
+    # 左栏放主时间和说明（顶对齐），右栏放倒计时和金额（右对齐、底对齐）。
+    # 竖排单列是四行全左对齐，两行两列是主时间配金额、说明配倒计时；这一种
+    # 是左上大字、右下次要信息，纵向错开，比前两种紧凑也更像"设计过"。
+    # 自己一套字号协商，不走下面那套四行的收缩流程。
+    if split:
+        gapx = max(8, int(10 * scale))
+        cap_txt = cap
+
+        def _fit_split(bsz):
+            """给定主字号，返回左右两栏的字体、行和尺寸"""
+            fb = (F_TXT if has_cjk(big) else F_NUM)(max(8, int(bsz * scale * fs_big)))
+            fs = F_NUM(max(6, int(bsz * 0.45 * scale * fs_big)))
+            csz = max(9, min(24, bsz * 0.34))
+            fc = F_TXT(max(8, int(csz * scale * fs_cap)))
+            if cap_txt and text_w(d, cap_txt, fc) > tw:
+                # 说明行自己太长就单独缩它，别让整栏的字号陪着一起降。
+                # 文案是用户随手填的，可能比主时间长好几倍，凭它一个人
+                # 把主时间拖到最小档不合理。
+                fc = shrink(cap_txt, fc.size, tw)
+            fm = F_MON(max(9, int(bsz * 0.42 * scale * fs_mon)))
+            fr = F_TXT(max(8, int(csz * scale * fs_slot)))
+            cap_n = int(clamp(cfg.get("slot_rows", 2), 1, SLOT_MAX, 2))
+            lines = wrap(parts, fr, int(tw * 0.55))[:cap_n] if parts else []
+            lw = max(text_w(d, big, fb)
+                     + ((int(6 * scale) + text_w(d, sec, fs)) if sec else 0),
+                     text_w(d, cap_txt, fc) if cap_txt else 0)
+            rw = max(max([text_w(d, l, fr) for l in lines], default=0),
+                     money_w(d, fm) if show_money else 0)
+            gapl = max(2, int(fr.size * 0.45 * gp))
+            # 高度一律按墨迹框算，不按字号。字号带着字体上下的留白，两栏用的
+            # 字号又不一样，拿它对齐的话小字那栏总要低一截——就是"底不齐"。
+            def _ih(t, f):
+                b = ink_box(d, t, f)
+                return b[3] - b[1], b[1]
+            bh_, bo_ = _ih(big, fb)
+            if sec:
+                # 秒数是另一个字体、按 em 顶单独定位画的，落点比主时间低，墨迹
+                # 还能再往下探一截。行高只按主时间算的话，这一截就是白捡的重叠——
+                # 隐藏说明行时左栏只剩这一行，右栏正好顶上来撞。
+                bh_ = max(bh_, int((fb.size - fs.size) * .75)
+                          + ink_box(d, sec, fs)[3])
+            lh = bh_
+            ch_ = co_ = 0
+            if cap_txt:
+                ch_, co_ = _ih(cap_txt, fc)
+                lh += int(fb.size * 0.30 * gp) + ch_
+            rh = 0
+            lo_ = 0
+            if lines:
+                l0h, lo_ = _ih(lines[0], fr)
+                rh = (len(lines) - 1) * (fr.size + gapl) + l0h
+            mh_ = mo_ = 0
+            if show_money:
+                mh_, mo_ = _ih(sym + money, fm)
+                rh += (int(fm.size * 0.45 * gp) if lines else 0) + mh_
+            return (fb, fs, fc, fm, fr, lines, gapl, lw, rw, lh, rh,
+                    bo_, co_, lo_, mo_, bh_)
+
+        # 两栏一个贴文字区顶、一个贴底。纵向错得开的时候它们压根不在同一行，
+        # 各自都能用满整条宽度；只有纵向撞上了，才需要「左栏宽 + 缝 + 右栏宽」。
+        # 以前不分情况一律按并排要求，等于替一个根本不存在的冲突买单——主时间
+        # 被右下角那三行小字挤掉一大截，中间还空着一大片。
+        mg = max(int(6 * scale), int(th * 0.06))
+        avail_h = th - mg * 2          # 真正能画的那一段，top 到 bottom
+        vgap = max(4, int(7 * scale))  # 纵向错开时两栏之间至少留这么点
+
+        def _split_fits(st):
+            lw, rw, lh, rh = st[7], st[8], st[9], st[10]
+            if lh + rh + vgap <= avail_h:
+                return lw <= tw and rw <= tw
+            return lw + gapx + rw <= tw and max(lh, rh) <= avail_h
+
+        # 上限按墨迹高算，不按字号。汉字的墨迹几乎等于字号，窄体数字只有七成，
+        # 同一条 BIG_MAX 拿字号一刀切，「已下班」就会比走秒的时钟粗一大圈——
+        # 原来那个 0.78 的 CJK 系数是在手工补这个差，换算一次就不用猜了。
+        _pb = ink_box(d, big, (F_TXT if has_cjk(big) else F_NUM)(100))
+        ink_k = max(0.1, (_pb[3] - _pb[1]) / 100.0)
+
+        def _search():
+            # 二分，不要一档一档往下减。以前是 for _ in range(80) 线性扫，高卡片上
+            # 起点能到 120 以上，80 步用完还没扫到放得下的档位，循环就这么退出去了，
+            # 带着一个从没验证过的字号往下画——主时间直接画到卡片外面。
+            lo = 14
+            hi = max(lo, int(min(th * BIG_MAX / ink_k, th - 20) / scale))
+            if hi > lo and not _split_fits(_fit_split(hi)):
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if _split_fits(_fit_split(mid)):
+                        lo = mid
+                    else:
+                        hi = mid
+                hi = lo
+            return hi
+
+        bsz = _search()
+        if cap_txt and not _split_fits(_fit_split(bsz)):
+            # 缩到字号下限还塞不下，说明行让位重来一次。跟竖排单列最后那条
+            # 兜底一个路子：宁可少显示一行，也不能让两栏叠在一起。
+            cap_txt = ""
+            bsz = _search()
+        (fb, fs, fc, fm, fr, lines, gapl, lw, rw, lh, rh,
+         bo_, co_, lo_, mo_, bh_) = _fit_split(bsz)
+
+        # 左栏贴文字区顶，右栏贴文字区底，中间空开——就是"左上右下"。
+        # 之前给它加过前提（说明行、倒计时、收入三样齐全才错开，少一样就退回
+        # 共用底线），结果隐藏了任何一样就永远看不到这个排法。去掉前提，一律错开。
+        top = ty + mg
+        bottom = ty + th - mg
+        # 下面所有 y 都是"墨迹顶"，画的时候各自减掉自己的墨迹偏移
+        ib = ink_box(d, big, fb)
+        draw_text(d, (tx - ib[0], top - bo_), big, fb, fg)
+        if sec:
+            draw_text(d, (tx + text_w(d, big, fb) + int(6 * scale),
+                          top + int((fb.size - fs.size) * .75)), sec, fs, fg2)
+        y_cap = top + lh
+        if cap_txt:
+            ic = ink_box(d, cap_txt, fc)
+            y_cap = top + lh - (ic[3] - ic[1])       # 左栏最后一行贴着左栏的底
+            draw_text(d, (tx - ic[0], y_cap - ic[1]), cap_txt, fc, fg2)
+        # 右栏贴同一条底线；整块贴右边，块内各行左对齐——逐行右对齐会让
+        # 「周五 0 天」「发薪 13 天」「¥551.72」三行的左边参差不齐。
+        ry = bottom - rh
+        blk_x = tx + tw - rw
+        yy = ry
+        for i, line in enumerate(lines):
+            draw_text(d, (blk_x, yy - lo_), line, fr, fg2)
+            yy += fr.size + (gapl if i < len(lines) - 1 else 0)
+        # 金额钉在右栏底线上，不从上面累加推下来。块高 rh 里最后一行倒计时记的是
+        # 墨迹高，绘制却按字号步进，两者差着字体上下那圈留白；累加到金额时已经
+        # 顶到 rh 之外，字号一大就直接压到卡片边上。
+        _mb = ink_box(d, sym + money, fm) if show_money else None
+        if show_money:
+            draw_money(d, (blk_x, bottom - _mb[3]), fm, accent + (255,))
+
+        if rects is not None:
+            # 高度用行的实际墨迹高（含秒数探出的那一截），不是 em 框——
+            # 播种自由排版时拿 em 框会比看得见的字大出一圈
+            rects.append(("big", tx, top, int(lw), bh_, fb.size))
+            if cap_txt:
+                rects.append(("cap", tx, y_cap, int(text_w(d, cap_txt, fc)),
+                              fc.size, fc.size))
+            if lines:
+                rects.append(("slot", int(blk_x), ry, int(rw),
+                              int(len(lines) * fr.size + gapl * (len(lines) - 1)),
+                              fr.size))
+            if show_money:
+                rects.append(("mon", int(blk_x), bottom - (_mb[3] - _mb[1]),
+                              int(money_w(d, fm)), _mb[3] - _mb[1], fm.size))
+        if cfg.get("_hover"):
+            cx, cy = W - int(16 * scale), int(14 * scale)
+            rr2 = max(1, int(1.6 * scale))
+            for kk in (-1, 0, 1):
+                ox = cx + kk * int(6 * scale)
+                d.ellipse((ox - rr2, cy - rr2, ox + rr2, cy + rr2), fill=fg2)
+        return im
+
+    room_r = tw if single else max(60, min(int(tw * 0.62), tw))
 
     # 倒计时最多占几行。没有这个上限的话，加满 6 项就会折成四五行，
     # 后面的收缩循环为了把它们全塞进去会把主时间一起压到最小档，
     # 结果整张卡片全是小字——宁可少显示两条，也不能让主显示区失真。
-    slot_cap = int(clamp(cfg.get("slot_rows", 2), 1, 4, 2))
+    slot_cap = int(clamp(cfg.get("slot_rows", 2), 1, SLOT_MAX, 2))
     CAPR_MIN = 10          # 倒计时字号下限，再小就不是给人看的了
 
     def rewrap(f):
         return wrap(parts, f, room_r)[:slot_cap] if parts else []
 
-    f_capr = f_cap
+    f_capr = F_TXT(max(8, int(cap_sz * scale * fs_slot)))
     slot_lines = rewrap(f_capr)
     while slot_lines and any(text_w(d, l, f_capr) > room_r for l in slot_lines) \
             and f_capr.size > CAPR_MIN:
         f_capr = F_TXT(f_capr.size - 1)
         slot_lines = rewrap(f_capr)
 
-    g_big = int(f_big.size * 0.34)
-    g_mid = int(f_mon.size * 0.42)
-    slot_gap = max(2, int(f_capr.size * 0.5))
+    g_big = int(f_big.size * 0.34 * gp)
+    g_mid = int(f_mon.size * 0.42 * gp)
+    slot_gap = max(2, int(f_capr.size * 0.5 * gp))
+
+    def _row_heights(fc, lines):
+        """竖排单列下每个可见行的高度，顺序按配置。measure 和实际绘制
+        共用这一份，两边就不会像以前金额那样各算各的、算着算着对不上。"""
+        out = []
+        for k, _a in plan:
+            if k == "big":
+                out.append(f_big.size)
+            elif k == "cap" and cap:
+                out.append(f_cap.size)
+            elif k == "mon" and show_money:
+                out.append(f_mon.size)
+            elif k == "slot" and lines:
+                out.append(len(lines) * fc.size
+                           + max(2, int(fc.size * 0.5 * gp)) * (len(lines) - 1))
+        return out
 
     def measure(fc, lines):
         """返回 (总高, 可撑开的间距合计)。用返回值传，别用模块全局——
         那样两次渲染之间会串值。"""
-        if use_L:
-            slot_h = (len(lines) * fc.size + slot_gap * max(0, len(lines) - 1)) if lines else 0
-            h = (f_mon.size if show_money else 0) \
-                + (int(fc.size * 0.6) if show_money and lines else 0) + slot_h
-            return h, 0
         if single:
-            rows = f_big.size + f_cap.size + fc.size * len(lines) \
-                   + (f_mon.size if show_money else 0)
-            gaps = g_big + (g_mid if show_money else 0) \
-                   + (int(fc.size * 0.9) if lines else 0) \
-                   + slot_gap * max(0, len(lines) - 1)
+            # 行序可调，所以高度也按"可见行列表"算，不再写死四行的加法。
+            # 行距按边界序号取：默认顺序下取到的正好是原来那三个值。
+            hs = _row_heights(fc, lines)
+            gl = [g_big, int(fc.size * 0.9), g_mid]
+            rows = sum(hs)
+            gaps = sum(gl[:max(0, len(hs) - 1)])
         else:
             slot_h = (len(lines) * fc.size + slot_gap * max(0, len(lines) - 1)) if lines else 0
             rows = max(f_big.size, f_mon.size if show_money else 0) \
-                   + max(f_cap.size, slot_h)
+                   + max(f_cap.size if cap else 0, slot_h)
             gaps = g_big
         return rows + gaps, gaps
 
@@ -894,7 +1421,7 @@ def render(cfg, theme, clock_ms=0):
     while block > th - guard and f_capr.size > CAPR_MIN:
         f_capr = F_TXT(f_capr.size - 1)
         slot_lines = rewrap(f_capr)
-        slot_gap = max(2, int(f_capr.size * 0.5))
+        slot_gap = max(2, int(f_capr.size * 0.5 * gp))
         block, _gaps_sum = measure(f_capr, slot_lines)   # measure 返回二元组，必须解包
 
     # 放不下时按优先级依次让步，而不是四个字号一起降。
@@ -911,7 +1438,7 @@ def render(cfg, theme, clock_ms=0):
         elif f_capr.size > CAPR_MIN:
             f_capr = F_TXT(f_capr.size - 1)
             slot_lines = rewrap(f_capr)
-            slot_gap = max(2, int(f_capr.size * 0.5))
+            slot_gap = max(2, int(f_capr.size * 0.5 * gp))
             shrunk = True
         elif f_cap.size > 10 or (show_money and f_mon.size > 11):
             if f_cap.size > 10:
@@ -919,13 +1446,13 @@ def render(cfg, theme, clock_ms=0):
             if show_money and f_mon.size > 11:
                 f_mon = F_MON(f_mon.size - 1)
             shrunk = True
-        elif f_big.size > 14 and (not use_L):
+        elif f_big.size > 14:
             big_sz = max(14, f_big.size / scale - 1)
             f_big = (F_TXT if has_cjk(big) else F_NUM)(int(big_sz * scale))
             f_sec = F_NUM(max(8, int(big_sz * 0.45 * scale)))
             shrunk = True
-        g_big = int(f_big.size * 0.34)
-        g_mid = int(f_mon.size * 0.42)
+        g_big = int(f_big.size * 0.34 * gp)
+        g_mid = int(f_mon.size * 0.42 * gp)
         block, _gaps_sum = measure(f_capr, slot_lines)
         if not shrunk:
             break
@@ -942,14 +1469,126 @@ def render(cfg, theme, clock_ms=0):
         cap = ""
         block, _gaps_sum = measure(f_capr, slot_lines)
 
+    # ---------- 反向撑满 ----------
+    # 上面那几个字号上限（64 / 72 / 52）是按扁卡片定的。卡片一高，算出来的
+    # 字号仍然停在上限，多出来的高度全摊给行距，看着就是几行小字浮在中间。
+    # 这里反过来再推一次：宽高都还有余量就整体加一档，直到某一维顶住。
+    # 只放大不缩小，所以跟前面整套收缩逻辑不会打架。
+    if single:
+        def _plan_h(fb, fc, fm, fr, lines, gap):
+            """这套字体在竖排单列下的最小占高。跟下面真正排版用的是同一套算法：
+            行高取墨迹框，行距取默认那一档。measure() 是给两列和 L 形用的，
+            行高按字号、三段行距各取各的，拿它判断还能不能放大会偏乐观。"""
+            hs = []
+            for k, _a in plan:
+                if k == "big":
+                    b = ink_box(d, big, fb)
+                    hs.append(b[3] - b[1])
+                elif k == "cap" and cap:
+                    b = ink_box(d, cap, fc)
+                    hs.append(b[3] - b[1])
+                elif k == "mon" and show_money:
+                    b = ink_box(d, sym + money, fm)
+                    hs.append(b[3] - b[1])
+                elif k == "slot" and lines:
+                    b = ink_box(d, lines[0], fr)
+                    hs.append((b[3] - b[1]) + (len(lines) - 1) * (fr.size + gap))
+            g_min = max(2, int(fc.size * 1.15 * gp))
+            return sum(hs) + g_min * max(0, len(hs) - 1)
+
+        def _set_for(pb):
+            """给定主字号（像素），推出整套字体和折行结果。
+            参数用的是最终像素而不是 big_sz —— 前面的收缩循环改的是 f_big.size
+            本身，big_sz 那个变量已经把 fs_big 折进去了，再乘一次会翻倍。"""
+            bsz = pb / (scale * max(0.01, fs_big))
+            fb = (F_TXT if has_cjk(big) else F_NUM)(int(pb))
+            fsc = F_NUM(max(8, int(pb * 0.45)))
+            csz = max(9, min(24, bsz * 0.30))
+            fc = F_TXT(int(csz * scale * fs_cap))
+            fm = F_MON(int(bsz * 0.52 * scale * fs_mon))
+            fr = F_TXT(max(8, int(csz * scale * fs_slot)))
+            return (fb, fsc, fc, fm, fr, rewrap(fr),
+                    max(2, int(fr.size * 0.5 * gp)))
+
+        def _fits(s):
+            fb, fsc, fc, fm, fr, lines, gapn = s
+            if text_w(d, big, fb) + (
+                    (int(6 * scale) + text_w(d, sec, fsc)) if sec else 0) > tw:
+                return False
+            if cap and text_w(d, cap, fc) > tw:
+                return False
+            if show_money and money_w(d, fm) > tw:
+                return False
+            if lines and max(text_w(d, l, fr) for l in lines) > room_r:
+                return False
+            return _plan_h(fb, fc, fm, fr, lines, gapn) <= th - guard
+
+        # 二分，不要一档一档往上试：大卡片能长四五十档，每档都要量一遍文字宽度，
+        # 动图逐帧渲染的时候这点开销会直接吃掉帧率。字号越大只会越宽越高，
+        # 放得下这件事是单调的，二分安全。
+        top_big = max(int(f_big.size), int(th * BIG_MAX))
+        lo, hi = int(f_big.size), min(int(f_big.size) + 160, top_big + 1)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if _fits(_set_for(mid)):
+                lo = mid
+            else:
+                hi = mid
+        best = _set_for(lo)
+        if lo > f_big.size and _fits(best):
+            (f_big, f_sec, f_cap, f_mon, f_capr,
+             slot_lines, slot_gap) = best
+
+        # 主时间经常先被宽度顶住（窄卡片上几乎必然），而说明和倒计时的字号是
+        # 从它的比例推出来的，还带着 min(24, ...) 那个上限——卡片放到多大，
+        # 这两行也就 24px。于是一行大字配三行小字，中间全是空白。
+        # 所以再单独放大一次次要行，按各自与主字的比例封顶，不喧宾夺主。
+        b_c, b_m, b_r = f_cap.size, f_mon.size, f_capr.size
+        top_c = max(b_c, int(f_big.size * 0.42))
+        top_m = max(b_m, int(f_big.size * 0.72))
+        top_r = max(b_r, int(f_big.size * 0.42))
+
+        def _sec_for(mul):
+            fc = F_TXT(min(top_c, max(8, int(b_c * mul / 100.0))))
+            fm = F_MON(min(top_m, max(9, int(b_m * mul / 100.0))))
+            fr = F_TXT(min(top_r, max(8, int(b_r * mul / 100.0))))
+            return fc, fm, fr, rewrap(fr), max(2, int(fr.size * 0.5 * gp))
+
+        def _sec_fits(s):
+            fc, fm, fr, lines, gapn = s
+            if cap and text_w(d, cap, fc) > tw:
+                return False
+            if show_money and money_w(d, fm) > tw:
+                return False
+            if lines and max(text_w(d, l, fr) for l in lines) > room_r:
+                return False
+            return _plan_h(f_big, fc, fm, fr, lines, gapn) <= th - guard
+
+        lo2, hi2 = 100, 300                    # 放大倍率，按百分比二分
+        while hi2 - lo2 > 4:
+            mid = (lo2 + hi2) // 2
+            if _sec_fits(_sec_for(mid)):
+                lo2 = mid
+            else:
+                hi2 = mid
+        sec_best = _sec_for(lo2)
+        if lo2 > 100 and _sec_fits(sec_best):
+            f_cap, f_mon, f_capr, slot_lines, slot_gap = sec_best
+        g_big = int(f_big.size * 0.34 * gp)
+        g_mid = int(f_mon.size * 0.42 * gp)
+        block, _gaps_sum = measure(f_capr, slot_lines)
+
     y = ty + max(int(6 * scale), (th - block) // 2)
 
     # ---------- 调试输出 ----------
     # set OFFWORK_DEBUG=1 后用 python widget.py 跑（不要用 pythonw，看不到输出）
     if os.environ.get("OFFWORK_DEBUG"):
+        print("[render] 图片带 %dx%d @(%d,%d) 带比例 %.3f 图片比例 %.3f %s"
+              % (bw, bh, bx, by, (bw / bh) if bh else 0, ratio,
+                 "堆叠" if stack else "两列"))
         print("[render] W=%d H=%d scale=%.2f | tx=%d ty=%d tw=%d th=%d "
-              "| single=%s stack=%s use_L=%s | block=%d guard=%d y=%d"
-              % (W, H, scale, tx, ty, tw, th, single, stack, use_L, block, guard, y))
+              "| single=%s stack=%s | block=%d guard=%d y=%d"
+              % (W, H, scale, tx, ty, tw, th, single, stack, block, guard, y))
         print("[render] sizes big=%d sec=%d cap=%d mon=%d capr=%d | lines=%r"
               % (f_big.size, f_sec.size, f_cap.size, f_mon.size, f_capr.size, slot_lines))
         print("[render] widths big=%.1f sec=%.1f cap=%.1f mon=%.1f"
@@ -958,81 +1597,83 @@ def render(cfg, theme, clock_ms=0):
                  money_w(d, f_mon) if show_money else 0))
 
     # ---------- 画文字 ----------
-    if use_L:
-        # 主时间和说明放进图片旁边的空白，收入和倒计时放下方那条
-        ah_block = f_big.size + int(f_big.size * 0.34) + f_cap.size
-        ya = ay + max(int(6 * scale), (ah - ah_block) // 2)
-        draw_text(d, (ax, ya), big, f_big, fg)
-        bwid = text_w(d, big, f_big)
-        if sec:
-            sx = min(ax + bwid + int(5 * scale),
-                     ax + aw - int(text_w(d, sec, f_sec)))     # 兜底，不越界
-            draw_text(d, (sx, ya + int((f_big.size - f_sec.size) * .75)),
-                      sec, f_sec, fg2)
-        ya += f_big.size + int(f_big.size * 0.34)
-        f_capl = f_cap if text_w(d, cap, f_cap) <= aw else shrink(cap, f_cap.size, aw)
-        draw_text(d, (ax, ya), cap, f_capl, fg2)
-
-        slot_h = (len(slot_lines) * f_capr.size
-                  + slot_gap * max(0, len(slot_lines) - 1)) if slot_lines else 0
-        bblock = (f_mon.size if show_money else 0) \
-                 + (int(f_capr.size * 0.6) if show_money and slot_lines else 0) + slot_h
-        yb = ty + max(int(4 * scale), (th - bblock) // 2)
-        yb = min(yb, H - int(4 * scale) - bblock)      # 兜底，绝不越过下沿
-        if show_money:
-            draw_money(d, (pad, yb), f_mon, accent + (255,))
-            yb += f_mon.size + (int(f_capr.size * 0.6) if slot_lines else 0)
-        for i, line in enumerate(slot_lines):
-            draw_text(d, (pad, yb + i * (f_capr.size + slot_gap)), line, f_capr, fg2)
-    elif single:
+    if single:
         # 卡片比内容高很多时（方形无图），把行距撑开铺满上下，
         # 比一味放大字号自然——内容还是成组的，只是呼吸感更足。
         # 只要还有余量就把行距撑开铺满，不限于方形无图那一种情况。
         # 撑开是在字号收缩之后做的，撑完必须再验一次没超框，
         # 否则某些占比区间会撑过头、行与行叠在一起。
-        rows_only = block - _gaps_sum
-        stretch = 1.0
-        if _gaps_sum > 0:
-            room_for_gaps = max(0, (th - guard) - rows_only)
-            stretch = max(1.0, min(3.5 if tall_empty else 2.4,
-                                   min(th * 0.86 - rows_only, room_for_gaps) / _gaps_sum))
-        while stretch > 1.0:
-            g_big_s = int(g_big * stretch)
-            g_mid_s = int(g_mid * stretch)
-            g_slot_s = int(int(f_capr.size * 0.9) * stretch)
-            block_s = rows_only + g_big_s + (g_mid_s if show_money else 0) \
-                      + (g_slot_s if slot_lines else 0) \
-                      + slot_gap * max(0, len(slot_lines) - 1)
-            if block_s <= th - guard:
-                break
-            stretch -= 0.1
-        else:
-            g_big_s, g_mid_s = g_big, g_mid
-            g_slot_s = int(f_capr.size * 0.9)
-            block_s = block
+        # 每行的字体和文本先定下来，排版按墨迹框走
+        f_capl = f_cap
+        if cap and text_w(d, cap, f_cap) > tw:
+            f_capl = shrink(cap, f_cap.size, tw)
+        bwid = text_w(d, big, f_big)
+        w_big = bwid + ((int(6 * scale) + text_w(d, sec, f_sec)) if sec else 0)
+        w_slot = max([text_w(d, l, f_capr) for l in slot_lines], default=0)
+
+        vis = []            # (键, 对齐, 宽, 墨迹左偏, 墨迹上偏, 墨迹高, 字号)
+        for k, al in plan:
+            if k == "big":
+                bx, byy, _bx2, by2 = ink_box(d, big, f_big)
+                vis.append((k, al, w_big, bx, byy, by2 - byy, f_big.size))
+            elif k == "cap" and cap:
+                bx, byy, _bx2, by2 = ink_box(d, cap, f_capl)
+                vis.append((k, al, text_w(d, cap, f_capl), bx, byy,
+                            by2 - byy, f_capl.size))
+            elif k == "mon" and show_money:
+                bx, byy, _bx2, by2 = ink_box(d, sym + money, f_mon)
+                vis.append((k, al, money_w(d, f_mon), bx, byy,
+                            by2 - byy, f_mon.size))
+            elif k == "slot" and slot_lines:
+                bx, byy, _bx2, by2 = ink_box(d, slot_lines[0], f_capr)
+                hblk = (by2 - byy) + (len(slot_lines) - 1) * (f_capr.size + slot_gap)
+                vis.append((k, al, w_slot, bx, byy, hblk, f_capr.size))
+
+        # 行距统一：原来三个间隙分别取自三个不同字体的比例（0.34×主字、
+        # 0.9×倒计时、0.42×金额），数值差好几倍，看着就是忽宽忽窄。
+        # 统一成一个值，再按剩余空间等比撑开。
+        rows_only = sum(v[5] for v in vis)
+        n_gap = max(0, len(vis) - 1)
+        g_row = max(2, int(f_cap.size * 1.15 * gp))
+        if n_gap:
+            # 剩下的高度在行距和上下留白之间平均分，留白正好等于一个行距。
+            # 以前行距封顶在 0.8 倍主字号，多出来的全落到上下两头——文字列一窄，
+            # 字号被宽度顶住长不上去，就成了中间挤成一块、上下各空一大片。
+            # 行距滑块乘在这里：拉大是行距吃掉留白，不是把整块推出去。
+            g_row = max(g_row, int((th - rows_only) / (n_gap + 2) * gp))
+            while rows_only + g_row * n_gap > th - guard and g_row > 2:
+                g_row -= 1
+        block_s = rows_only + g_row * n_gap
         y = ty + max(int(6 * scale), (th - block_s) // 2)
 
-        draw_text(d, (tx, y), big, f_big, fg)
-        bwid = text_w(d, big, f_big)
-        if sec:
-            draw_text(d, (tx + bwid + int(6 * scale),
-                          y + int((f_big.size - f_sec.size) * .75)), sec, f_sec, fg2)
-        y += f_big.size + g_big_s
+        def _x(align, ww):
+            if align == "center":
+                return tx + max(0, (tw - int(ww)) // 2)
+            if align == "right":
+                return tx + max(0, tw - int(ww))
+            return tx
 
-        f_capl = f_cap if text_w(d, cap, f_cap) <= tw else shrink(cap, f_cap.size, tw)
-        draw_text(d, (tx, y), cap, f_capl, fg2)
-
-        # 倒计时紧跟在说明行下面（都是小字灰字，成一组），收入放最后一行。
-        # 收入是彩色重点，压在底部比夹在中间更稳。
-        y += f_cap.size
-        if slot_lines:
-            y += g_slot_s
-            for i, line in enumerate(slot_lines):
-                draw_text(d, (tx, y + i * (f_capr.size + slot_gap)), line, f_capr, fg2)
-            y += len(slot_lines) * f_capr.size + slot_gap * (len(slot_lines) - 1)
-        if show_money:
-            y += g_mid_s
-            draw_money(d, (tx, y), f_mon, accent + (255,))
+        for idx, (k, al, ww, inkx, inky, inkh, fsz) in enumerate(vis):
+            x = _x(al, ww)
+            # 减掉墨迹的左偏和上偏，对齐的是看得见的边缘，不是 em 框
+            dx, dy = x - inkx, y - inky
+            if k == "big":
+                draw_text(d, (dx, dy), big, f_big, fg)
+                if sec:
+                    draw_text(d, (dx + bwid + int(6 * scale),
+                                  dy + int((f_big.size - f_sec.size) * .75)),
+                              sec, f_sec, fg2)
+            elif k == "cap":
+                draw_text(d, (dx, dy), cap, f_capl, fg2)
+            elif k == "mon":
+                draw_money(d, (dx, dy), f_mon, accent + (255,))
+            else:
+                for j2, line in enumerate(slot_lines):
+                    draw_text(d, (dx, dy + j2 * (f_capr.size + slot_gap)),
+                              line, f_capr, fg2)
+            if rects is not None:
+                rects.append((k, x, y, int(ww), int(inkh), fsz))
+            y += inkh + g_row
     else:
         # 两行两列：第一行主字与金额底部对齐，第二行说明与倒计时顶部对齐。
         # 文字区比内容高很多时把行距撑开，否则两行贴在一起浮在中间。
@@ -1077,7 +1718,7 @@ def render(cfg, theme, clock_ms=0):
             if f_capr.size > CAPR_MIN:
                 f_capr = F_TXT(f_capr.size - 1)
                 slot_lines = rewrap(f_capr)
-                slot_gap = max(2, int(f_capr.size * 0.5))
+                slot_gap = max(2, int(f_capr.size * 0.5 * gp))
             else:
                 slot_lines.pop()            # 缩到底还撞，就少显示一条倒计时
         slot_w = max([text_w(d, l, f_capr) for l in slot_lines], default=0)
@@ -1086,7 +1727,7 @@ def render(cfg, theme, clock_ms=0):
         slot_h = (len(slot_lines) * f_capr.size
                   + slot_gap * max(0, len(slot_lines) - 1)) if slot_lines else 0
         r1 = max(f_big.size, f_mon.size if show_money else 0)
-        r2 = max(f_cap.size, slot_h)
+        r2 = max(f_cap.size if cap else 0, slot_h)
         g2 = g_big
         if th - guard > r1 + r2 + g_big:
             g2 = int(min(th * 0.86 - r1 - r2, g_big * 9))
@@ -1106,14 +1747,29 @@ def render(cfg, theme, clock_ms=0):
 
         y2 = base_y + g2
         # lim 已在上面按倒计时的实际宽度算好，不再用固定的 45%
-        f_capl = f_cap if text_w(d, cap, f_cap) <= lim else shrink(cap, f_cap.size, lim)
-        draw_text(d, (tx, y2), cap, f_capl, fg2)
+        if cap:
+            f_capl = f_cap if text_w(d, cap, f_cap) <= lim else shrink(cap, f_cap.size, lim)
+            draw_text(d, (tx, y2), cap, f_capl, fg2)
         # 整块贴右边，但块内各行左对齐——逐行右对齐会让「周五 0 天」和
         # 「发薪 13 天」左边参差不齐，读起来像没对上。
         blk_x = tx + tw - slot_w
         for i, line in enumerate(slot_lines):
             draw_text(d, (blk_x, y2 + i * (f_capr.size + slot_gap)),
                       line, f_capr, fg2)
+
+        if rects is not None:
+            # 播种自由排版要用。四条分支都得记，否则在没记的那种布局下
+            # 切到自由排版会拿不到初值，文字直接跑没影。
+            rects.append(("big", tx, base_y - f_big.size,
+                          int(_row1_w()), f_big.size, f_big.size))
+            if show_money:
+                rects.append(("mon", tx + tw - mw, base_y - f_mon.size,
+                              int(mw), f_mon.size, f_mon.size))
+            if cap:
+                rects.append(("cap", tx, y2, int(text_w(d, cap, f_capl)),
+                              f_capl.size, f_capl.size))
+            if slot_lines:
+                rects.append(("slot", blk_x, y2, int(slot_w), slot_h, f_capr.size))
 
     # ---- 设置入口：鼠标悬停时才浮现 ----
     if cfg.get("_hover"):
@@ -1258,6 +1914,7 @@ except AttributeError:
 
 class Widget:
     def __init__(self):
+        self._first_run = not os.path.exists(CFG)
         self.cfg = read_cfg()
         self.theme = system_theme()
         self.hwnd = None
@@ -1294,6 +1951,12 @@ class Widget:
         self.apply_blur()
         self.set_topmost(bool(self.cfg.get("top", True)), force=True)
         self.sync_timer()
+        if self._first_run:
+            # 头一次跑，配置文件还不存在：与其给一个跟屏幕无关的 320x104，
+            # 不如按这块屏推一个。用户改过之后就再也不动了。
+            w, h = suggest_size(self.work_area(), self.cfg.get("ui", 100))
+            write_cfg({"cardw": w, "cardh": h})
+            self.cfg["cardw"], self.cfg["cardh"] = w, h
         self.paint()
         if self.cfg.get("alttab"):
             self.apply_alttab()
@@ -1617,57 +2280,59 @@ _settings_open = threading.Event()
 _settings_root = [None]          # 存一份 Tk root，好把已开的窗口提到前面
 
 
-def auto_fit(cfg):
-    """按图片实际比例反推卡片高度，占宽超限时反向压缩占宽"""
-    path = os.path.join(IMGDIR, cfg.get("img_file") or "")
-    if not cfg.get("img_file") or not os.path.exists(path):
-        return cfg
-    try:
-        with Image.open(path) as im:
-            ratio = im.width / im.height
-    except Exception:
-        return cfg
-    W = clamp(cfg.get("cardw", 320), W_MIN, W_MAX, 320)
-    IW_MIN, IW_MAX = 20, 70
-    iw = max(IW_MIN, min(IW_MAX, int(cfg.get("iw", 45))))
-    h = (W * iw / 100) / ratio
-    if h > H_MAX:
-        h = H_MAX
-        iw = max(IW_MIN, min(IW_MAX, round(h * ratio / W * 100)))
-        h = (W * iw / 100) / ratio
-    # 倒计时占几行也要算进去，否则换成宽幅图后卡片变矮，文字被挤出去
-    n_lines = (len(cfg.get("slots", [])) + 1) // 2
-    need = 96 + 18 * max(0, n_lines - 1)
-    cfg["iw"] = iw
-    cfg["cardh"] = int(max(H_MIN, need, min(H_MAX, round(h))))
-    cfg["ix"] = cfg["iy"] = 0
-    return cfg
+def suggest_size(wa, ui=100, portrait=False):
+    """按屏幕可用区域推一个卡片尺寸。
+
+    桌面小组件占屏宽 15~20% 是常见档位，再大就从"角落里的小工具"变成"面板"了。
+    横版取屏高的 19% 当高度、1.8 倍当宽度；竖版取屏高的 28% 做成方卡，下面那条
+    文字区由自动加高补出来。返回逻辑尺寸（没乘缩放），跟配置里存的一致。
+    """
+    sh = max(1, wa.bottom - wa.top)
+    k = max(0.75, min(1.5, float(ui) / 100))
+    if portrait:
+        w = h = int(round(sh * 0.28 / k / 10) * 10)
+    else:
+        h = int(round(sh * 0.19 / k / 10) * 10)
+        w = int(round(h * 1.8 / 10) * 10)
+    return (max(W_MIN, min(W_MAX, w)), max(H_MIN, min(H_MAX, h)))
 
 
 TAB_KEYS = {
-    "工作": ["start", "end", "salary", "cur_sym", "sym_gap", "work_text", "show_money"],
-    "外观": ["bg", "ui", "cardw", "cardh", "glass", "top", "alttab", "auto_size", "dock", "dock_pad"],
-    "图片": ["img_fill", "img_side", "text_pct", "iw", "iw_auto", "ix", "iy",
-             "fade", "rotate_min", "shuffle", "auto_resize"],
-    "倒计时": ["slots", "slot_rows"],
+    "工作": ["start", "end", "salary", "cur_sym", "sym_gap", "work_text", "show_money", "show_cap"],
+    "外观": ["bg", "ui", "cardw", "cardh", "glass", "top", "alttab",
+             "dock", "dock_pad", "tint", "tint_amt"],
+    "图片": ["img_side", "fade", "rotate_min", "shuffle"],
+    "倒计时": ["slots", "slot_rows", "slot_each"],
 }
 
 
-def place_settings(root, widget):
+def place_settings(root, widget, only_if_overlap=False):
     """把设置窗口摆到组件旁边的空白处。
 
     组件是置顶的，设置窗口压在它上面就看不见改动效果，只能一边改一边挪窗口。
-    尺寸要等控件都建完才准，所以这一步放在 mainloop 之前做，不能在 Tk() 之后
-    就算——那时候 winfo 拿到的还是 1x1。
+
+    两个坑：
+    - 尺寸要等窗口真正映射出来才准。Tk() 之后马上量拿到的是 1x1，
+      update_idletasks 之后拿到的是客户区，不含标题栏和边框，
+      按客户区算会以为放得下、实际盖住一角。所以补上一圈装饰的余量。
+    - 切页签时 Notebook 会改变窗口大小，原来不重叠的位置可能就压上去了，
+      所以切页签也重判一次，但只在真的压住时才挪，免得窗口乱跳。
     """
     root.update_idletasks()
-    w = max(root.winfo_reqwidth(), root.winfo_width())
-    h = max(root.winfo_reqheight(), root.winfo_height())
+    w = max(root.winfo_reqwidth(), root.winfo_width()) + 16      # 左右边框
+    h = max(root.winfo_reqheight(), root.winfo_height()) + 40    # 标题栏
     try:
         r = wt.RECT()
         user32.GetWindowRect(widget.hwnd, ctypes.byref(r))
         wa = widget.work_area()
     except Exception:
+        return
+
+    def hits(x, y):
+        return (x < r.right and x + w > r.left
+                and y < r.bottom and y + h > r.top)
+
+    if only_if_overlap and not hits(root.winfo_rootx(), root.winfo_rooty()):
         return
     gap = 12
     for x, y in ((r.right + gap, r.top),          # 右
@@ -1677,7 +2342,7 @@ def place_settings(root, widget):
         x = max(wa.left, min(x, wa.right - w))
         y = max(wa.top, min(y, wa.bottom - h))
         # 夹回工作区之后可能又压到组件上了，得重新判一次相交
-        if not (x < r.right and x + w > r.left and y < r.bottom and y + h > r.top):
+        if not hits(x, y):
             root.geometry("+%d+%d" % (x, y))
             return
     root.geometry("+%d+%d" % (wa.left, wa.top))   # 四边都塞不下，贴左上角
@@ -1842,15 +2507,23 @@ def _build(widget):
 
     add_check(t1, 4, "符号与数字之间空一格", "sym_gap", False)
     add_entry(t1, 5, "上班文案", "work_text", maxlen=12)
+    def on_show(key, var, row):
+        write_cfg({key: var.get()})
+        widget.reload()
+
     money_v = tk.BooleanVar(value=bool(cfg.get("show_money", True)))
     VARS["show_money"] = lambda val, v=money_v: v.set(bool(val))
     ttk.Checkbutton(t1, text="显示今日收入", variable=money_v,
-                    command=lambda: (write_cfg({"show_money": money_v.get()}),
-                                     widget.reload())
+                    command=lambda: on_show("show_money", money_v, "mon")
                     ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    cap_v = tk.BooleanVar(value=bool(cfg.get("show_cap", True)))
+    VARS["show_cap"] = lambda val, v=cap_v: v.set(bool(val))
+    ttk.Checkbutton(t1, text="显示说明行（距下班 · 18:30）", variable=cap_v,
+                    command=lambda: on_show("show_cap", cap_v, "cap")
+                    ).grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
     ttk.Label(t1, text="货币符号可以直接在框里改，最多 4 个字符；汉字量词会自动放到\n"
                        "数字后面（288.91 元）。上班文案留空用「距下班」",
-              foreground="#888", justify="left").grid(row=7, column=0, columnspan=3,
+              foreground="#888", justify="left").grid(row=8, column=0, columnspan=3,
                                                       sticky="w")
 
     # ================= 外观 =================
@@ -1874,39 +2547,69 @@ def _build(widget):
     add_scale(t2, 1, "整体缩放", "ui", 75, 150, 100)
     add_scale(t2, 2, "卡片宽度", "cardw", 180, 720, 320)
     add_scale(t2, 3, "卡片高度", "cardh", 90, 640, 104)
-    ttk.Button(t2, text="正方形", width=8,
-               command=lambda: (write_cfg({"cardw": 300, "cardh": 300}),
-                                widget.reload())
-               ).grid(row=4, column=2, sticky="e", pady=(2, 0))
-    gl = add_scale(t2, 5, "玻璃浓度", "glass", 14, 230, 90)
+    # 横版加宽、竖版加高，都会让实际尺寸跟滑块对不上。滑块本身看不出这件事，
+    # 所以把实际尺寸摆在下面一行，一眼就知道自己拖的那个管不管用。
+    size_lbl = ttk.Label(t2, text="", foreground="#888")
+    size_lbl.grid(row=5, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+    def size_hint():
+        c = read_cfg()
+        k = max(0.75, min(1.5, float(c.get("ui", 100)) / 100))
+        bw_ = int(clamp(c.get("cardw", 320), W_MIN, W_MAX, 320) * k)
+        bh_ = int(clamp(c.get("cardh", 104), H_MIN, H_MAX, 104) * k)
+        w, h = widget.size
+        if w <= 0 or (abs(w - bw_) <= 2 and abs(h - bh_) <= 2):
+            return ""
+        why = "自动算的"
+        which = []
+        if abs(w - bw_) > 2:
+            which.append("宽度")
+        if abs(h - bh_) > 2:
+            which.append("高度")
+        return "实际 %dx%d，%s是%s，滑块不起作用" % (
+            w, h, "、".join(which), why)
+
+    def use_suggested(portrait):
+        w, h = suggest_size(widget.work_area(), read_cfg().get("ui", 100), portrait)
+        write_cfg({"cardw": w, "cardh": h})
+        widget.reload()
+        for k, v in (("cardw", w), ("cardh", h)):
+            fn = VARS.get(k)
+            if fn:
+                fn(v)
+
+    szbar = ttk.Frame(t2)
+    szbar.grid(row=4, column=0, columnspan=3, sticky="e", pady=(2, 0))
+    ttk.Label(szbar, text="按屏幕大小：").grid(row=0, column=0)
+    ttk.Button(szbar, text="横版", width=8,
+               command=lambda: use_suggested(False)).grid(row=0, column=1, padx=(0, 4))
+    ttk.Button(szbar, text="竖版", width=8,
+               command=lambda: use_suggested(True)).grid(row=0, column=2)
+    gl = add_scale(t2, 6, "玻璃浓度", "glass", 1, 255, 90)
+    # 这三个控件的引用要在这里就抓住。grid_remove() 之后控件不再受 grid 管理，
+    # grid_slaves(row=5) 会返回空列表 —— 藏起来就再也找不回来了，
+    # 表现就是切回毛玻璃时滑块不出现，得重开设置窗口。
+    _glass_ws = list(t2.grid_slaves(row=6))
 
     def glass_row(show):
-        for w in t2.grid_slaves(row=5):
-            w.grid_remove() if not show else w.grid()
+        for w in _glass_ws:
+            w.grid() if show else w.grid_remove()
     glass_row(cfg.get("bg") == "glass")
 
-    add_check(t2, 6, "窗口置顶", "top", True)
-    as_v = tk.BooleanVar(value=bool(cfg.get("auto_size", False)))
-    VARS["auto_size"] = lambda val, v=as_v: v.set(bool(val))
-    ttk.Checkbutton(t2, text="按图片比例自动调整卡片尺寸（贴三边不裁切）",
-                    variable=as_v,
-                    command=lambda: (write_cfg({"auto_size": as_v.get()}),
-                                     widget.reload())
-                    ).grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
-
+    add_check(t2, 7, "窗口置顶", "top", True)
     alt_v = tk.BooleanVar(value=bool(cfg.get("alttab", False)))
     VARS["alttab"] = lambda val, v=alt_v: v.set(bool(val))
     ttk.Checkbutton(t2, text="在 Alt+Tab 中显示", variable=alt_v,
                     command=lambda: (write_cfg({"alttab": alt_v.get()}),
                                      widget.apply_alttab())
-                    ).grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+                    ).grid(row=8, column=0, columnspan=3, sticky="w", pady=3)
     ttk.Button(t2, text="回到屏幕中央", command=widget.center
-               ).grid(row=8, column=0, columnspan=3, sticky="we", pady=(8, 0))
+               ).grid(row=9, column=0, columnspan=3, sticky="we", pady=(8, 0))
 
     auto_v = tk.BooleanVar(value=os.path.exists(STARTUP_VBS))
     ttk.Checkbutton(t2, text="开机自启", variable=auto_v,
                     command=lambda: set_autostart(auto_v.get())
-                    ).grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
+                    ).grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
 
     dock_v = tk.BooleanVar(value=bool(cfg.get("dock", True)))
     VARS["dock"] = lambda val, v=dock_v: v.set(bool(val))
@@ -1916,6 +2619,15 @@ def _build(widget):
                                      widget.reload())
                     ).grid(row=11, column=0, columnspan=3, sticky="w", pady=3)
     add_scale(t2, 12, "贴边留白", "dock_pad", 0, 40, 12)
+
+    tint_v = tk.BooleanVar(value=bool(cfg.get("tint", False)))
+    VARS["tint"] = lambda val, v=tint_v: v.set(bool(val))
+    ttk.Checkbutton(t2, text="卡片配色跟随当前图片（强调色取主色，底色掺一点）",
+                    variable=tint_v,
+                    command=lambda: (write_cfg({"tint": tint_v.get()}),
+                                     widget.reload())
+                    ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
+    add_scale(t2, 14, "取色浓度", "tint_amt", 0, 40, 14)
 
     # ================= 图片 =================
     t3 = ttk.Frame(nb, padding=12)
@@ -1955,8 +2667,6 @@ def _build(widget):
         c = read_cfg()
         if pool and c.get("img_file") not in pool:
             c["img_file"] = pool[0]
-            if c.get("auto_resize"):             # 默认关闭，免得把手调好的尺寸冲掉
-                c = auto_fit(c)
         write_cfg(c)
         refresh_img_label()
         widget.reload()
@@ -1987,10 +2697,6 @@ def _build(widget):
         widget.paint()
         refresh_img_label()
 
-    def refit():
-        write_cfg(auto_fit(read_cfg()))
-        widget.reload()
-
     bar = ttk.Frame(t3)
     bar.grid(row=0, column=0, columnspan=3, sticky="we", pady=(18, 0))
     ttk.Button(bar, text="导入(可多选)", command=pick, width=11).grid(row=0, column=0, padx=2)
@@ -1999,37 +2705,53 @@ def _build(widget):
     ttk.Button(bar, text="下一张", command=lambda: step_img(1),
                width=7).grid(row=0, column=2, padx=2)
     ttk.Button(bar, text="清空", command=clear, width=6).grid(row=0, column=3, padx=2)
-    ttk.Button(bar, text="按比例调整", command=refit, width=11).grid(row=0, column=4, padx=2)
-    FILL = {"贴三边（会裁切）": "cover", "完整显示（留白）": "fit"}
-    frev = {v: k for k, v in FILL.items()}
-    ttk.Label(t3, text="填充").grid(row=4, column=0, sticky="w", pady=4)
-    fillv = tk.StringVar(value=frev.get(cfg.get("img_fill", "cover"),
-                                        "贴三边（会裁切）"))
-    ttk.Combobox(t3, textvariable=fillv, width=20, state="readonly",
-                 values=list(FILL.keys())).grid(row=4, column=1, columnspan=2,
-                                                sticky="we", pady=4)
-    VARS["img_fill"] = lambda val, v=fillv, rv=frev: v.set(rv.get(val, list(rv.values())[0]))
-    fillv.trace_add("write", lambda *_: (write_cfg({"img_fill": FILL[fillv.get()]}),
-                                         widget.reload()))
 
-    add_scale(t3, 13, "文字区占比 %", "text_pct", 25, 65, 40)
+    # 图片在文字的哪一侧。竖版和横版不是同一个方向，所以措辞跟着当前排法走：
+    # 竖版 -> 图在上 / 图在下；横版 -> 图在左 / 图在右。存的还是同一个键。
+    SIDE_TXT = {True: ("图在上", "图在下"), False: ("图在左", "图在右")}
+    ttk.Label(t3, text="图片位置").grid(row=1, column=0, sticky="w", pady=4)
+    sidev = tk.StringVar()
+    side_cb = ttk.Combobox(t3, textvariable=sidev, width=20, state="readonly")
+    side_cb.grid(row=1, column=1, columnspan=2, sticky="we", pady=4)
+    _side_raw = ["right" if cfg.get("img_side") == "right" else "left"]
+    _side_fill = [False]          # 回填措辞时别让它反过来触发保存
 
-    SIDE = {"靠左": "left", "居中": "center", "靠右": "right"}
-    srev = {v: k for k, v in SIDE.items()}
-    ttk.Label(t3, text="靠边").grid(row=5, column=0, sticky="w", pady=4)
-    sidev = tk.StringVar(value=srev.get(cfg.get("img_side", "left"), "靠左"))
-    ttk.Combobox(t3, textvariable=sidev, width=20, state="readonly",
-                 values=list(SIDE.keys())).grid(row=5, column=1, columnspan=2,
-                                                sticky="we", pady=4)
-    VARS["img_side"] = lambda val, v=sidev, rv=srev: v.set(rv.get(val, list(rv.values())[0]))
-    sidev.trace_add("write", lambda *_: (write_cfg({"img_side": SIDE[sidev.get()]}),
-                                         widget.reload()))
+    def refresh_side():
+        """措辞跟着当前排法换。改 values 和回填都要挡住 trace，
+        否则 Tk 在旧文字不在新列表里时会把变量清掉，反过来触发一次保存。"""
+        a, b = SIDE_TXT[bool(_STACK[0])]
+        want = b if _side_raw[0] == "right" else a
+        if list(side_cb["values"]) == [a, b] and sidev.get() == want:
+            return
+        _side_fill[0] = True
+        try:
+            side_cb.config(values=[a, b])
+            sidev.set(want)
+        finally:
+            _side_fill[0] = False
 
-    ar = tk.BooleanVar(value=bool(cfg.get("auto_resize", False)))
-    VARS["auto_resize"] = lambda val, v=ar: v.set(bool(val))
-    ttk.Checkbutton(t3, text="导入图片时按比例改卡片尺寸", variable=ar,
-                    command=lambda: write_cfg({"auto_resize": ar.get()})
-                    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    def on_side(*_):
+        """按选中项在列表里的**位置**判断，不拿文字去比对。
+
+        原来是用 _STACK[0] 反推标签再比对文字：竖版比「图在下」、横版比「图在右」。
+        可 _STACK[0] 是每次渲染都在写的全局值，预览、播种、组件各渲各的，只要在
+        点下拉和回调之间翻一下，比对就对不上，位置被悄悄复位成默认——这就是
+        "自动重排会恢复图片位置"。位置索引跟谁在渲染无关。
+        """
+        if _side_fill[0]:
+            return
+        vals = list(side_cb["values"])
+        cur = sidev.get()
+        _side_raw[0] = "right" if (cur in vals and vals.index(cur) == 1) else "left"
+        write_cfg({"img_side": _side_raw[0]})
+        widget.reload()
+    sidev.trace_add("write", on_side)
+
+    def _set_side(val):
+        _side_raw[0] = "right" if val == "right" else "left"
+        refresh_side()
+    VARS["img_side"] = _set_side
+    refresh_side()
 
     ROT = {"不轮换": 0, "每分钟": 1, "每 5 分钟": 5, "每 15 分钟": 15,
            "每小时": 60, "每 6 小时": 360, "每天": 1440}
@@ -2049,22 +2771,12 @@ def _build(widget):
                                      widget.reload())
                     ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
-    iwa = tk.BooleanVar(value=bool(cfg.get("iw_auto", True)))
-    VARS["iw_auto"] = lambda val, v=iwa: v.set(bool(val))
-    ttk.Checkbutton(t3, text="自动占宽（文字用多少留多少，其余给图片）",
-                    variable=iwa,
-                    command=lambda: (write_cfg({"iw_auto": iwa.get()}), widget.reload())
-                    ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 2))
-    add_scale(t3, 7, "手动占宽 %", "iw", 20, 70, 45)
-    add_scale(t3, 8, "水平偏移", "ix", -300, 300, 0)
-    add_scale(t3, 9, "垂直偏移", "iy", -300, 300, 0)
-    ttk.Button(t3, text="偏移归零", width=10,
-               command=lambda: (write_cfg({"ix": 0, "iy": 0}), widget.reload())
-               ).grid(row=10, column=2, sticky="e", pady=(2, 0))
-    add_scale(t3, 11, "淡出", "fade", 0, 100, 22)
-    ttk.Label(t3, text="横图贴左右上三边，竖图贴上下和一侧。文字区占比控制另一边留多少",
-              foreground="#888").grid(row=12, column=0, columnspan=3,
-                                      sticky="w", pady=(6, 0))
+    add_scale(t3, 4, "淡出", "fade", 0, 100, 22)
+    ttk.Label(t3, text="图片按自己的宽高比完整显示，绝不裁切。排法由卡片形状决定：\n"
+                       "宽 > 高 时图在左、字在右；高 ≥ 宽 时图在上、字在下。\n"
+                       "图片没占满的那一维会居中。",
+              foreground="#888", justify="left").grid(row=6, column=0, columnspan=3,
+                                                      sticky="w", pady=(6, 0))
     refresh_img_label()
 
     # ================= 倒计时 =================
@@ -2154,22 +2866,32 @@ def _build(widget):
                 if dd is not None and dd < 0:
                     ttk.Label(holder, text="已过期", foreground="#c33").grid(
                         row=i, column=5, padx=(4, 0))
+        sync_add_btn(len(slots))
+
+    def sync_add_btn(n):
+        """到上限就置灰。留着能点但点了没反应，看着像坏了。
+        存量配置里超过上限的项照样列出来，可以删，只是不能再加。"""
+        try:
+            add_btn.state(["disabled"] if n >= SLOT_MAX else ["!disabled"])
+        except Exception:
+            pass
 
     def add_slot():
         s = read_cfg().get("slots", [])
-        if len(s) >= 6:
+        if len(s) >= SLOT_MAX:
             return
         s.append({"label": "节日", "type": "date", "value": date.today().isoformat()})
         save_slots(s)
         draw_slots()
 
-    ttk.Button(t4, text="+ 添加一项", command=add_slot).grid(row=1, column=0,
-                                                             sticky="we", pady=(8, 0))
+    add_btn = ttk.Button(t4, text="+ 添加一项", command=lambda: add_slot())
+    add_btn.grid(row=1, column=0, sticky="we", pady=(8, 0))
     rowbox = ttk.Frame(t4)
     rowbox.grid(row=2, column=0, sticky="we", pady=(10, 0))
-    add_scale(rowbox, 0, "最多占几行", "slot_rows", 1, 4, 2)
-    ttk.Label(t4, text="最多 6 项，放不下自动换行；超过上面设的行数就不显示了。\n"
-                       "过期的不显示，勾「每年」可年年重复",
+    add_scale(rowbox, 0, "最多占几行", "slot_rows", 1, SLOT_MAX, 2)
+    add_check(rowbox, 1, "每条单独一行（不挤在同一行里）", "slot_each", False)
+    ttk.Label(t4, text="最多 %d 项，放不下自动换行；超过上面设的行数就不显示了。\n"
+                       "过期的不显示，勾「每年」可年年重复" % SLOT_MAX,
               foreground="#888").grid(row=3, column=0, sticky="w", pady=(6, 0))
     draw_slots()
 
@@ -2194,12 +2916,11 @@ def _build(widget):
             draw_slots()
         if "bg" in patch:
             glass_row(patch["bg"] == "glass")
-        if "img_fill" in patch or "iw_auto" in patch:
-            pass
         dirty.clear()              # 控件回填会触发 trace，别让旧值又写回去
         widget.reload()
 
-    for tab_name, frame in (("工作", t1), ("外观", t2), ("图片", t3), ("倒计时", t4)):
+    for tab_name, frame in (("工作", t1), ("外观", t2), ("图片", t3),
+                            ("倒计时", t4)):
         row = frame.grid_size()[1]
         ttk.Button(frame, text="恢复本页默认", width=14,
                    command=lambda n=tab_name: reset_tab(n)
@@ -2214,6 +2935,11 @@ def _build(widget):
 
     def poll_err():
         err.config(text=("保存失败：" + _LAST_SAVE_ERR[0]) if _LAST_SAVE_ERR[0] else "")
+        try:
+            size_lbl.config(text=size_hint())
+            refresh_side()        # 排法变了，「图片位置」的措辞要跟着换
+        except Exception:
+            pass
         try:
             root.after(800, poll_err)
         except Exception:
@@ -2230,6 +2956,10 @@ def _build(widget):
 
     root.protocol("WM_DELETE_WINDOW", root.destroy)
     place_settings(root, widget)
+    # 映射出来之后再摆一次，这时候拿到的才是真实尺寸
+    root.after(150, lambda: place_settings(root, widget, True))
+    nb.bind("<<NotebookTabChanged>>",
+            lambda *_: root.after(60, lambda: place_settings(root, widget, True)))
     root.mainloop()
 
 
