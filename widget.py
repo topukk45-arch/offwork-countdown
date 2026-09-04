@@ -5,7 +5,9 @@
 依赖: pip install pillow pystray
 运行: pythonw widget.py
 """
+import calendar
 import colorsys
+import math
 import ctypes
 import ctypes.wintypes as wt
 import json
@@ -48,6 +50,18 @@ IMG_MAX = 0.60      # 图片最多占卡片的几成（宽或高，看排法）�
                     # 摆在设置里徒增困惑
 SLOT_MAX = 3        # 倒计时最多几项。这是个桌面小组件，不是日程表——
                     # 六项在小卡片上本来也塞不下，砍行之后照样只显示三两条
+WORK_BUDGET = 16_000_000   # 工作图最多这么多像素（约 64MB），封住超大图的内存
+ZOOM_MAX = 16       # 取景放大上限。原来写死 6，可一张 11537 宽的图压进 224 宽的
+                    # 图区是 52 倍，放到 6 倍才刚到原图的 1/8.6，人脸还是糊的。
+                    # 真正的上限应该由图片自己的分辨率决定，见 zoom_cap。
+LONG_GAP = 3        # 图区没占满、空出这么多像素就算"看得出来"，进裁切取景模式
+IMG_MIN_H = 0.22    # 堆叠布局下图片至少占卡片这么高。超宽合集图按比例只有
+                    # 几十像素，压成一条横缝，得抬起来横向裁。
+IMG_MIN = 0.30      # 两列布局下图片至少占卡片这么宽（默认值，设置里可调）。
+                    # 上限 IMG_MAX 管的是横图占太多，这条管竖图占太少——
+                    # 1:2.65 的立绘不设下限只有 13%，一条缝，脸都看不清。
+IMG_MIN_LO = 15     # 滑块范围。低于 15% 图又变回一条缝，等于这条保险没有；
+IMG_MIN_HI = 45     # 高于 45% 文字区不足一半，主时间会被压得比图还小。
 DOCK_SNAP = 28      # 拖动结束时离边缘小于这个距离就算吸附
 RADIUS = 16
 TEXT_CR = 4.5       # 次要文字和金额相对卡片底色的最低对比度（WCAG AA 正文档）。
@@ -63,6 +77,17 @@ DEFAULTS = {
     "sym_gap": False,          # 符号和数字之间空一格
     "show_money": True,
     "show_cap": True,          # 是否显示「距下班 · 18:30」那一行
+    "show_sec": True,          # 主时间后面那两位秒
+    "workdays": [1, 2, 3, 4, 5],   # 每周哪几天上班，1=周一 … 7=周日
+    "rest_text": "",           # 休息日主文案，留空用「休息日」
+    "lunch": False,            # 是否扣除午休
+    "lunch_start": "12:00",
+    "lunch_end": "13:30",
+    "lunch_text": "",          # 午休主文案，留空用「午休中」
+    "img_fill": "auto",        # 图片填充：auto 自动 / contain 适应 / cover 填满
+    "img_lock": True,          # 锁上图片，右键拖动不会误挪取景
+    "img_view": {},            # 每张图的取景：{文件名: [缩放, 横偏移, 纵偏移]}
+    "img_min": 30,             # 横版下图片至少占卡片百分之多少宽
     "bg": "auto",              # auto | light | dark | glass
     "glass": 90,
     "ui": 100,                 # 缩放百分比
@@ -195,6 +220,16 @@ def system_theme():
     return out
 
 
+def _win_build():
+    """Windows 内部版本号。Win11 是 22000 起，毛玻璃要靠它分流：
+    Win10 用 BLURBEHIND(3)，Win11 上那个 state 已经不出模糊了，得走
+    ACRYLICBLURBEHIND(4)。见 apply_blur。"""
+    try:
+        return sys.getwindowsversion().build
+    except Exception:
+        return 0
+
+
 # 字体必须缓存。一次 render 里光收缩循环就要建几十个字体对象，
 # 每个 truetype() 都是重新打开并解析一遍 ttf（msyh.ttc 十几 MB），
 # 动图每秒十几帧的话这一项就能吃掉大半 CPU。
@@ -298,8 +333,40 @@ def split_runs(text):
     return runs
 
 
+_WIDE_DIGIT = {}
+
+
+def wide_digit(font):
+    """这个字体里最宽的那个数字。窄体里 0~9 的宽度不一定相同。"""
+    k = (getattr(font, "path", ""), font.size)
+    hit = _WIDE_DIGIT.get(k)
+    if hit is None:
+        try:
+            hit = max("0123456789", key=lambda c: font.getlength(c))
+        except Exception:
+            hit = "0"
+        _WIDE_DIGIT[k] = hit
+    return hit
+
+
+def steady(text, font):
+    """把数字换成本字体里最宽的那个，只用来量尺寸。
+
+    排版每秒重算一次，而 "11" 比 "58" 窄——字号协商的结果就跟着秒数抖，
+    肉眼能看出字忽大忽小。收入那行每秒都在变，更明显。
+    按"最宽的数字"量，同样位数量出来的宽度恒定，字号就不再跳。
+    绘制用的仍然是真实文字，只有测量走这一步。
+    """
+    t = str(text)
+    if not any(c.isdigit() for c in t):
+        return t
+    w = wide_digit(font)
+    return "".join(w if c.isdigit() else c for c in t)
+
+
 def text_w(d, text, font):
-    """混排文字的总宽度"""
+    """混排文字的总宽度。数字按最宽的那个算，见 steady。"""
+    text = steady(text, font)
     total = 0
     for emo, part in split_runs(text):
         total += d.textlength(part, font=emoji_font(font.size)[0] if emo else font)
@@ -315,7 +382,7 @@ def ink_box(d, text, font):
     数字行和汉字行之间看着也忽大忽小。按墨迹框排就没这问题。
     """
     try:
-        b = font.getbbox(str(text))
+        b = font.getbbox(steady(text, font))
         if b and b[2] > b[0] and b[3] > b[1]:
             return b[0], b[1], b[2], b[3]
     except Exception:
@@ -350,15 +417,26 @@ def hm(s):
 
 
 def days_monthly(now, day):
-    day = max(1, min(28, int(day)))
+    """每月某号。29/30/31 号要落到当月实际的最后一天——2 月是 28 或 29，
+    小月是 30。原来一律夹到 28 号，31 号发薪的人整整提前三天，而且设置里
+    填进去也不报错，看不出被改过。
+
+    「最后一天」是发薪日的通行处理：公司定 31 号发，2 月就 28 号发，
+    不会拖到 3 月 3 号。
+    """
+    day = max(1, min(31, int(day)))
     today = now.date()
+
+    def at(y, m):
+        return date(y, m, min(day, calendar.monthrange(y, m)[1]))
+
     y, m = today.year, today.month
-    nxt = date(y, m, day)
+    nxt = at(y, m)
     if nxt < today:
         m += 1
         if m > 12:
             m, y = 1, y + 1
-        nxt = date(y, m, day)
+        nxt = at(y, m)
     return (nxt - today).days
 
 
@@ -382,16 +460,149 @@ def days_date(now, iso, yearly=False):
     return (t - today).days
 
 
+def month_days(cfg):
+    """月计薪天数。双休时正好是 21.75——那是 (365 - 52*2) / 12，
+    也就是法定的那个数，所以默认值不会因为改成推导而变。
+    配成单休、大小周之后 21.75 就不对了，收入会算少，所以跟着周设置走。"""
+    n = len(workdays_of(cfg))
+    return max(1.0, (365 - 52 * (7 - n)) / 12.0)
+
+
+def workdays_of(cfg):
+    """一天都不选会导致除零，也没人真的一天不上班，这种情况按双休兜底。"""
+    d = [int(x) for x in cfg.get("workdays", [1, 2, 3, 4, 5])
+         if str(x).isdigit() and 1 <= int(x) <= 7]
+    return sorted(set(d)) or [1, 2, 3, 4, 5]
+
+
+def _buttons(d, cfg, rects, W, scale, col, has_img, bx, by, bw, bh, long_img):
+    """悬停时浮现的两个按钮。
+
+    设置固定在卡片右上角，锁固定在图区左上角——锁管的是这张图的取景，
+    钉在图上才说得清它作用于谁；跟着图片方位走，图切到右边、上边、下边，
+    锁都跟过去。中间试过把锁挪到右上角跟设置并排，画面是干净了，但"锁的是
+    哪张图"这层关系就没了，而且切换图片方位时它一动不动，看不出关联。
+
+    真正难看的是当初那块黑方块衬底和过大的尺寸，不是位置。现在两个按钮都
+    不铺底，颜色用取色出来的主色（跟金额同一个来源，已过对比度地板），
+    压在图上时描一圈反色边，压在纯色区就不描。
+
+    split 分支和其余分支原来各画各的三个点，改一处漏一处——竖版上按钮就没
+    跟着更新。抽出来两边共用。
+    """
+    if not cfg.get("_hover"):
+        return
+    btn = max(18, int(22 * scale))
+    pad_ = max(3, int(5 * scale))
+    ink = col + (255,)
+    halo = (255, 255, 255, 190) if _lum(col) < 0.5 else (0, 0, 0, 190)
+
+    def ring(fn, on_img):
+        """压在图上时先用反色描粗一圈，再画本体盖上去。图片什么颜色都有，
+        光靠取色出来的那一种，撞上同色区域就整个融进去了。"""
+        if on_img:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx or dy:
+                        fn(dx, dy, halo)
+        fn(0, 0, ink)
+
+    def over_img(x, y):
+        return has_img and bx < x + btn and bx + bw > x and by < y + btn and by + bh > y
+
+    # 设置：右上角，位置固定，不跟着图跑。
+    sx, sy = W - btn - pad_, pad_
+    rr = max(2, int(2.2 * scale))
+    cx, cy = sx + btn // 2, sy + btn // 2
+
+    def dots(dx, dy, c):
+        for k in (-1, 0, 1):
+            ox = cx + k * int(rr * 3.0) + dx
+            d.ellipse((ox - rr, cy - rr + dy, ox + rr, cy + rr + dy), fill=c)
+    ring(dots, over_img(sx, sy))
+    if rects is not None:
+        rects.append(("_btn_set", sx, sy, btn, btn, 0))
+
+    # 锁：只有长图才有。普通比例的图完整显示就挺好，没有"看哪一段"这回事，
+    # 多一个可拖可缩的状态反而是给正常情况添乱。
+    if has_img and long_img and bw > btn * 2 and bh > btn * 2:
+        lx, ly = bx + pad_, by + pad_
+        # 图顶到卡片右上角时，锁会跟设置撞在一起，往下让一个身位。
+        if abs(lx - sx) < btn and abs(ly - sy) < btn:
+            ly = by + btn + pad_ * 2
+        closed = bool(cfg.get("img_lock", True))
+        ring(lambda dx, dy, c: _draw_lock(d, lx + dx, ly + dy, btn, c, closed),
+             over_img(lx, ly))
+        if rects is not None:
+            rects.append(("_btn_lock", lx, ly, btn, btn, 0))
+
+
+def _draw_lock(d, x, y, n, col, closed):
+    """挂锁。二十来个像素里画细节会糊成一团，所以只靠一个特征区分状态：
+    锁上时锁梁两条腿都落到锁体上，解锁时右腿抬起来、整个梁往右上挪。
+    尺寸给足——锁体占到按钮的六成，比例再小就只剩一个黑点。"""
+    w = int(n * 0.58)                      # 锁体
+    h = int(n * 0.40)
+    bx0 = x + (n - w) // 2
+    by0 = y + n - int(n * 0.16) - h
+    lw = max(2, int(n * 0.11))
+    r = w * 0.34                           # 锁梁半径
+    if closed:
+        cx, cy = bx0 + w / 2, by0
+        d.arc((cx - r, cy - r * 2, cx + r, cy), 180, 360, fill=col, width=lw)
+        d.line((cx - r, cy - r, cx - r, by0), fill=col, width=lw)
+        d.line((cx + r, cy - r, cx + r, by0), fill=col, width=lw)
+    else:
+        cx, cy = bx0 + w / 2 + r * 1.1, by0 - r * 0.5
+        d.arc((cx - r, cy - r * 2, cx + r, cy), 180, 360, fill=col, width=lw)
+        d.line((cx - r, cy - r, cx - r, cy + r * 0.4), fill=col, width=lw)
+    d.rounded_rectangle((bx0, by0, bx0 + w, by0 + h),
+                        radius=max(1, int(n * 0.09)), fill=col)
+
+
+def lunch_of(cfg):
+    """午休区间（分钟）。没开、时间填错、或者落在上下班之外就当没有。
+
+    边界一律取"半开区间"：到点开始算休息，结束那一刻就算复工。跨零点、
+    开始晚于结束、整段在上班时间之外这些情况全部退回不扣，宁可少算也不要
+    算出负数工时——收入是给人看的，出个负数比不扣午休严重得多。
+    """
+    if not cfg.get("lunch"):
+        return None
+    try:
+        ls, le = hm(cfg.get("lunch_start", "")), hm(cfg.get("lunch_end", ""))
+    except Exception:
+        return None
+    st, ed = hm(cfg["start"]), hm(cfg["end"])
+    if ls >= le or le <= st or ls >= ed:
+        return None
+    ls, le = max(ls, st), min(le, ed)      # 夹进上班时段，防止把工时扣成负的
+    if le - ls < 1 or (ed - st) - (le - ls) < 1:
+        return None                        # 扣完不剩工时，等于没上班，不扣
+    return ls, le
+
+
+def worked(cur, st, ed, lunch):
+    """从上班到此刻，实际干了多少分钟（已扣午休）。"""
+    d = max(0.0, min(cur, ed) - st)
+    if lunch:
+        ls, le = lunch
+        d -= max(0.0, min(cur, le) - ls)   # 午休里已经过去的那部分不算工时
+    return max(0.0, d)
+
+
 def compute(cfg):
     """返回渲染需要的全部文字和进度"""
     now = datetime.now()
     cur = now.hour * 60 + now.minute + now.second / 60
     st, ed = hm(cfg["start"]), hm(cfg["end"])
-    weekend = now.weekday() >= 5
+    # 原来写死 weekday() >= 5，等于假设全世界都双休。单休、大小周、
+    # 周末排班的都用不了。isoweekday 是 1=周一 … 7=周日，跟配置里存的一致。
+    rest = now.isoweekday() not in workdays_of(cfg)
     prog, big, sec = 0.0, "", ""
 
-    if weekend:
-        big, cap = "休息日", "不计薪"
+    if rest:
+        big, cap = (cfg.get("rest_text") or "休息日"), "不计薪"
     elif cur >= ed:
         big, cap, prog = "已下班", "今天到此为止", 1.0
         sec = ""
@@ -400,12 +611,27 @@ def compute(cfg):
         big, sec = "%02d:%02d" % (d // 3600, d // 60 % 60), "%02d" % (d % 60)
         cap = "距上班 · " + cfg["start"]
     else:
-        d = round((ed - cur) * 60)
-        big, sec = "%02d:%02d" % (d // 3600, d // 60 % 60), "%02d" % (d % 60)
-        prog = (cur - st) / (ed - st)
-        cap = "%s · %s" % (cfg.get("work_text") or "距下班", cfg["end"])
+        lunch = lunch_of(cfg)
+        total = (ed - st) - ((lunch[1] - lunch[0]) if lunch else 0)
+        prog = worked(cur, st, ed, lunch) / max(1e-6, total)
+        if lunch and lunch[0] <= cur < lunch[1]:
+            # 午休时段跟「已下班」同一个路子：主时间直接显示文案，不走倒计时。
+            # 中午盯着秒表看什么时候要回去干活，不如就写「午休中」。
+            # 收入这时候停住不涨。
+            big, sec = (cfg.get("lunch_text") or "午休中"), ""
+            cap = "%s 复工" % cfg.get("lunch_end", "")
+        else:
+            d = round((ed - cur) * 60)
+            big, sec = "%02d:%02d" % (d // 3600, d // 60 % 60), "%02d" % (d % 60)
+            cap = "%s · %s" % (cfg.get("work_text") or "距下班", cfg["end"])
 
-    money = "%.2f" % (float(cfg.get("salary") or 0) / 21.75 * prog)
+    # 关掉秒就给空串。渲染那边到处是 if sec 的判断，空串会一路跳过——
+    # 连字号协商里「秒数向下探出的墨迹」那一项也跟着不算，所以关掉秒之后
+    # 主时间还能自动长大一点，不用另外处理。
+    if not cfg.get("show_sec", True):
+        sec = ""
+
+    money = "%.2f" % (float(cfg.get("salary") or 0) / month_days(cfg) * prog)
 
     parts = []
     for sl in cfg.get("slots", []):
@@ -423,7 +649,8 @@ def compute(cfg):
 
 # ============================ 渲染 ============================
 _FIT_WHY = [""]      # 自动加宽这一帧的结论，设置窗口把它显示出来
-_STACK = [False]     # 这一帧是不是竖版（图在上）。设置窗口拿它切「靠边」的措辞
+_STACK = [False]
+_IMG_CAPPED = [False]   # 当前这张图已经顶到 IMG_MAX 上限，「图片占宽」拖不动了     # 这一帧是不是竖版（图在上）。设置窗口拿它切「靠边」的措辞
 _CARD_CACHE = {}
 _NOISE_CACHE = {}
 _GIF_CACHE = {}
@@ -475,26 +702,87 @@ def image_pool():
         return []
 
 
-def load_frames(path, bw, bh, cfg, vertical=False, flip=False):
+def load_frames(path, bw, bh, cfg, vertical=False, flip=False, long_img=False):
     """GIF / APNG / 动态 WebP 逐帧预处理并缓存。
     返回 (帧列表, 每帧毫秒列表, 总时长)。静态图就是单帧。"""
     try:
         mt = os.path.getmtime(path)
     except OSError:
         return [], [], 0
-    key = (path, mt, bw, bh, int(cfg.get("fade", 45)), vertical, flip)
+    # 取景参数必须进缓存键，否则拖动/缩放之后拿到的还是上一版的帧，画面不动。
+    key = (path, mt, bw, bh, int(cfg.get("fade", 45)), vertical, flip,
+           long_img, view_of(cfg) if long_img else None,
+           str(cfg.get("img_fill", "auto")))
     hit = _GIF_CACHE.get(key)
     if hit:
         return hit
 
     frames, durs = [], []
     try:
+        # 每次都重新 open，不缓存这个对象。
+        # 试过缓存它，结果多帧图全线报错：Image 对象内部带着"当前停在第几帧"
+        # 的游标，逐帧 seek 完之后再从缓存拿到的是停在最后一帧的那一个，
+        # 于是 cannot seek to frame 0 / attempt to seek outside sequence /
+        # images do not match 轮流来。缓存文件句柄本身就是错的做法。
+        # open 本身很便宜（不解码像素），真正省时间的是下游的 _RGBA_CACHE。
+        #
+        # draft 让 JPEG 在解码阶段按 DCT 直接出小图，省掉大半解码时间。
+        # 余量给 2 倍：draft 只能按 2 的幂次降，给 6 倍的话 4K 图正好落回
+        # 全尺寸等于白做；2 倍解出来 960x540，仍比图区大九倍。
+        cap = (max(1, max(bw, bh) * 2), max(1, max(bw, bh) * 2))
         src = Image.open(path)
+        try:
+            src.draft("RGB", cap)
+        except Exception:
+            pass                         # 只有 JPEG 支持，其余格式忽略
         total = getattr(src, "n_frames", 1)
         step = max(1, total // 120)        # 帧太多就抽帧，别把内存吃光
         for i in range(0, total, step):
             src.seek(i)
-            frames.append(place(src.convert("RGBA"), bw, bh, cfg, vertical, flip))
+            # 工作图：解码 + 转 RGBA + 降到"够用"的尺寸，缓存起来。
+            #
+            # 关键是它的尺寸**只跟这张图最多能放多大有关，跟当前缩放无关**。
+            # 之前设计成跟着缩放走，结果滚轮每拨一格就换一个尺寸、键就不命中，
+            # 每格都要把整张原图重新解码降采样一遍——11537 像素的图解一次
+            # 600ms，所以"拖动很顺、一滚就卡"。拖动只改偏移不改缩放，正好
+            # 绕开了这个坑，这也是为什么两者表现差那么多。
+            #
+            # 尺寸取 图区 x 放大上限：放到头时裁出来的那一块正好还有 bw 个
+            # 像素，全程都是缩小取样，不会出现"把小图硬拉大"的糊。
+            # 再用像素预算封顶，免得超大图把内存吃光。
+            _zc = zoom_cap(src.width, bw) if long_img else 1.0
+            _ww, _wh = max(1, int(bw * _zc * 1.15)), max(1, int(bh * _zc * 1.15))
+            if _ww * _wh > WORK_BUDGET:            # 太大就等比压回预算内
+                _r = (WORK_BUDGET / float(_ww * _wh)) ** 0.5
+                _ww, _wh = max(1, int(_ww * _r)), max(1, int(_wh * _r))
+            rk = (path, mt, i, _ww, _wh)
+            rgba = _RGBA_CACHE.get(rk)
+            if rgba is None:
+                # reduce 是整数倍抽样，快但丢信息，负责把量级压下来；零头交给
+                # LANCZOS 收尾。只用 LANCZOS 从 4K 直接缩要慢一个数量级。
+                # reduce 不认调色板模式，而 GIF 正是 P 模式，直接调会每帧抛
+                # "unrecognized image mode"，所以 P/PA/1 得先转 RGBA 再缩。
+                _base = src.convert("RGBA") if src.mode in ("P", "PA", "1") else src
+                _f = min(_base.width // max(1, _ww), _base.height // max(1, _wh))
+                if _f >= 2:
+                    try:
+                        _base = _base.reduce(min(_f, 16))
+                    except ValueError:
+                        pass          # 别的模式不支持就跳过，交给下面的 resize
+                rgba = _base.convert("RGBA")
+                # 按长边等比降，不要两边独立夹——独立夹会把图拉变形。
+                _long = max(rgba.width, rgba.height)
+                _capl = max(_ww, _wh)
+                if _long > _capl * 1.15:
+                    _r = _capl / float(_long)
+                    rgba = rgba.resize((max(1, int(rgba.width * _r)),
+                                        max(1, int(rgba.height * _r))),
+                                       Image.LANCZOS)
+                if len(_RGBA_CACHE) > 130:
+                    _RGBA_CACHE.clear()
+                _RGBA_CACHE[rk] = rgba
+            frames.append(place(rgba, bw, bh, cfg, vertical, flip, long_img,
+                                ck0=rk))
             durs.append(max(30, src.info.get("duration", 100) * step))
     except Exception as e:
         print("frame load failed:", e)
@@ -506,18 +794,190 @@ def load_frames(path, bw, bh, cfg, vertical=False, flip=False):
     return out
 
 
-def place(src, bw, bh, cfg, vertical=False, flip=False):
+_OPAQUE_CACHE = {}
+_SCALE_CACHE = {}          # 缩放到某个尺寸的结果，拖动取景时反复要用
+_RGBA_CACHE = {}           # 转成 RGBA 的每一帧，按路径+帧号
+
+
+def img_opaque(path):
+    """这张图是不是实心的（照片）而不是抠好的贴纸。按路径和修改时间缓存，
+    每帧都去解一次大图太浪费。"""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return True
+    hit = _OPAQUE_CACHE.get(path)
+    if hit and hit[0] == mt:
+        return hit[1]
+    try:
+        with Image.open(path) as im:
+            if "A" not in im.getbands() and im.mode not in ("P", "PA"):
+                v = True             # 连 alpha 通道都没有，不用解码就知道是实心的
+            else:
+                # 只看四条边透不透明，不需要全尺寸。一张 11537x4876 的 PNG
+                # 全解一遍要两秒多，而这个函数一帧里会被问好几次。
+                im.draft("RGB", (256, 256))
+                im.thumbnail((256, 256), Image.NEAREST)
+                v = mostly_opaque(im.convert("RGBA"))
+    except Exception:
+        v = True
+    _OPAQUE_CACHE[path] = (mt, v)
+    return v
+
+
+def is_long_img(bw, bh, ratio, opaque, scale=1.0, shrink_x=1.0):
+    """这张图有没有被裁掉一部分——被裁了才需要让用户挑看哪一段。
+
+    判据是"图区的形状和图片的形状差多少"。图区现在是按卡片撑满的（见布局
+    那段 fill_band），所以比例一旦对不上，就说明有内容被切在框外。
+
+    试过按"空出多少像素"判，那是撑满之前的写法：撑满之后空白恒等于零，
+    锁就再也不出现了。也试过面积占比和宽高比之差，前者会把"细长但填得满"
+    和"占地大但两边空"混为一谈，后者恒等于零。
+
+    透明底的贴纸不进这条路：它周围本来就是空的，不撑满也看不出来，
+    撑满反而会把头顶脚底切掉。
+    """
+    if not opaque or bh <= 0 or ratio <= 0:
+        return False
+    band = bw / float(bh)
+    off = max(band, ratio) / max(0.001, min(band, ratio))
+    if off > 1.05:             # 形状差 5% 以上，说明确实切掉了东西
+        return True
+    # 形状对得上也可能需要取景：一张 11537 宽的横幅压进 224 宽的图区，比例
+    # 分毫不差，判据说"没裁"，可内容早糊成一条了。缩得太狠的时候，放大挑
+    # 一段看比整张糊着看有用得多，所以也给锁。
+    return shrink_x > 14
+
+
+def mostly_opaque(src):
+    """判断是不是"照片"而不是"贴纸"。
+
+    贴纸是抠好的透明底 PNG，四周本来就是空的，留边根本看不出来，裁反而会
+    把头顶或者脚切掉。照片是实心矩形，一留边就是两条明显的空白。
+    只看四条边上的 alpha：贴纸的主体在中间，边缘几乎全透明。
+    """
+    if src.mode != "RGBA":
+        return True
+    a = src.split()[3]
+    w, h = a.size
+    if w < 4 or h < 4:
+        return True
+    px = a.load()
+    step = max(1, min(w, h) // 32)          # 采样，别逐像素扫大图
+    vals = []
+    for x in range(0, w, step):
+        vals.append(px[x, 0]); vals.append(px[x, h - 1])
+    for y in range(0, h, step):
+        vals.append(px[0, y]); vals.append(px[w - 1, y])
+    return sum(1 for v in vals if v > 200) > len(vals) * 0.75
+
+
+def has_view(cfg):
+    """用户手动调过这张图的取景没有。调过就别再套默认值。"""
+    return (cfg.get("img_file") or "") in (cfg.get("img_view") or {})
+
+
+def zoom_cap(src_w, bw):
+    """这张图放大到几倍就到原图分辨率了，再放大只是把像素拉大。
+    小图不给假余量——一张 300px 的表情包在 224 的框里，放大 1.3 倍就到头了。"""
+    if bw <= 0 or src_w <= 0:
+        return 1.0
+    return max(1.0, min(float(ZOOM_MAX), src_w / float(bw)))
+
+
+def view_of(cfg):
+    """当前这张图的取景参数 [缩放, 横偏移, 纵偏移]，偏移都是 -1..1。
+
+    按文件名存。批量导入几十张再开轮换，存一份全局值的话换张图取景就全乱了。
+    """
+    v = (cfg.get("img_view") or {}).get(cfg.get("img_file") or "")
+    try:
+        z, ox, oy = float(v[0]), float(v[1]), float(v[2])
+    except Exception:
+        return 1.0, 0.0, 0.0
+    return (max(1.0, min(ZOOM_MAX, z)), max(-1.0, min(1.0, ox)),
+            max(-1.0, min(1.0, oy)))
+
+
+def place(src, bw, bh, cfg, vertical=False, flip=False, long_img=False, ck0=None):
     """把图片放进目标框。
 
-    目标框的宽高比是照着图片算出来的，所以这里等比缩放就正好填满，不裁。
-    取整会差一两像素，居中放，两边各分半个像素的误差。
-    淡出方向永远朝着文字那一侧，由 vertical / flip 两个参数定。
+    自动尺寸开着的时候，目标框的宽高比是照着图片算出来的，min 和 max 结果
+    一样，填不填满没区别。但用户一旦手动定死图区宽度（iw_auto 关掉），
+    比例就对不上了，min 会在上下留出两条空白——透明底的贴纸看不出来，
+    换成不透明的照片就很明显。所以填充方式要能选。
+
+    long_img 是另一回事：图区在卡片里占得太小的时候（细长立绘、全景横幅），
+    完整显示就是一条看不清的细缝。这时候改成裁一段铺满，并让用户自己拖着
+    选看哪一段。普通比例的图不进这条路，免得平白多出可拖可缩的状态。
     """
-    k = min(bw / src.width, bh / src.height)
-    src = src.resize((max(1, int(round(src.width * k))),
-                      max(1, int(round(src.height * k)))), Image.LANCZOS)
-    out = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
-    out.paste(src, ((bw - src.width) // 2, (bh - src.height) // 2), src)
+    mode = str(cfg.get("img_fill", "auto")).lower()
+    if mode not in ("contain", "cover"):
+        mode = "cover" if (long_img or mostly_opaque(src)) else "contain"
+    if long_img:
+        mode = "cover"
+    zoom, ox, oy = view_of(cfg) if long_img else (1.0, 0.0, 0.0)
+    if long_img and not has_view(cfg):
+        # 没手动调过取景时，竖长图默认取顶部而不是居中。立绘、海报、同人图
+        # 的主体几乎都在上半部，居中裁正好把脸切掉只剩衣服和腿。
+        # 横长图仍然居中——全景照片的重点通常在中间。
+        if src.height > src.width * 1.3:
+            oy = -1.0
+    k = (max if mode == "cover" else min)(bw / src.width, bh / src.height) * zoom
+    tw_, th_ = (max(1, int(round(src.width * k))),
+                max(1, int(round(src.height * k))))
+    # 缩放结果只跟目标尺寸有关，跟平移到哪儿无关。拖动取景时每帧都重缩一次
+    # 4K 原图要 170 多毫秒（LANCZOS 0.5s / 6 帧），等于 6fps，拖起来像卡死。
+    # 把缩放好的那一版留住，拖动就只剩一次 paste。
+    # 用调用方给的稳定标识当键。原来拿 id(src)，可每帧传进来的都是
+    # src.convert("RGBA") 新建的对象，id 每次都不一样，缓存一次都命中不了。
+    # 先在原图上裁出"要看的那一块"，再只放大这一块。
+    # 原来是把整张放大到 tw_ x th_ 再从中间贴一小块出来——8 倍时那是上百万
+    # 像素，其中绝大部分算完立刻丢掉，滚轮每拨一格都要付这笔钱，越滚越慢。
+    # 裁完再放大，工作量只跟图区大小有关，跟放大倍数无关。
+    ex, ey = tw_ - bw, th_ - bh
+    px = (bw - tw_) // 2 - int(ex * ox / 2) if ex > 0 else (bw - tw_) // 2
+    py = (bh - th_) // 2 - int(ey * oy / 2) if ey > 0 else (bh - th_) // 2
+    sx = max(0.0, -px) / max(1e-6, k)          # 换算回原图坐标
+    sy = max(0.0, -py) / max(1e-6, k)
+    sw = min(src.width - sx, bw / max(1e-6, k))
+    sh = min(src.height - sy, bh / max(1e-6, k))
+    # 不再分"草稿/精修"两阶段。裁一小块再缩本来就只有几毫秒，用不着降质量；
+    # 而两阶段会让画面在停手后再刷一次，看着像"滚完又重新加载一遍"。
+
+    if sw >= 1 and sh >= 1 and (ex > 0 or ey > 0):
+        piece = src.crop((int(sx), int(sy),
+                          int(sx) + max(1, int(round(sw))),
+                          int(sy) + max(1, int(round(sh)))))
+        dw = max(1, min(bw, int(round(piece.width * k))))
+        dh = max(1, min(bh, int(round(piece.height * k))))
+        ck = (ck0, dw, dh, int(sx), int(sy))
+        hit = _SCALE_CACHE.get(ck)
+        if hit is not None:
+            piece = hit
+        else:
+            piece = piece.resize((dw, dh),
+                                 Image.LANCZOS)
+            if len(_SCALE_CACHE) > 8:
+                _SCALE_CACHE.clear()
+            _SCALE_CACHE[ck] = piece
+        out = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+        out.paste(piece, (max(0, px), max(0, py)), piece)
+    else:
+        # 没有可裁的余量（缩小或正好铺满），老路子：整张缩到目标尺寸
+        ck = (ck0, tw_, th_)
+        hit = _SCALE_CACHE.get(ck)
+        if hit is not None:
+            src = hit
+        else:
+            src = src.resize((tw_, th_),
+                             Image.LANCZOS)
+            if len(_SCALE_CACHE) > 8:
+                _SCALE_CACHE.clear()
+            _SCALE_CACHE[ck] = src
+        out = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+        out.paste(src, ((bw - src.width) // 2, (bh - src.height) // 2), src)
 
     fade = max(0, min(100, int(cfg.get("fade", 45)))) / 100
     if fade > 0:
@@ -571,8 +1031,17 @@ def dominant_color(path):
     try:
         with Image.open(path) as src:
             src.seek(0)                       # 动图只看第一帧
-            im = src.convert("RGBA")
-            im.thumbnail((64, 64))
+            # 先缩再转，顺序反了会很贵：原来是 convert 在前，等于把整张图
+            # 转成 RGBA 之后再丢掉 99.99%。一张 11537x4876 的 PNG 光这一步
+            # 就是 1.7 秒，而这里只要一个 64px 的缩略图。
+            src.draft("RGB", (64, 64))
+            # 不用 copy：src 是 with 块里的临时对象，thumbnail 原地改它没影响，
+            # 而复制一张 11537x4876 的图要 0.86 秒。
+            # reduce 先整数倍抽样把量级压下来，再让 thumbnail 收尾。
+            f = min(src.width // 64, src.height // 64)
+            im = src.reduce(min(f, 16)) if f >= 2 else src
+            im.thumbnail((64, 64), Image.NEAREST, reducing_gap=None)
+            im = im.convert("RGBA")
             px = [q for q in im.getdata() if q[3] > 128]
     except Exception:
         return None
@@ -745,10 +1214,21 @@ def render(cfg, theme, clock_ms=0, rects=None):
     # 上面那几个混合比例是按"好看"调的，没有一处保证读得清。这里统一兜一次底：
     # 达标就原样放行（绝大多数情况），不达标才推亮度。放在最后做，所以不管前面
     # 怎么混、混几层，出口只有这一个。
-    # 毛玻璃下底色是半透明的，真正的背景是桌面，量不到；仍然按 base 算——
-    # 卡片本来就是照着 base 配色的，这是能拿到的最好参照。
-    fg2 = ensure_cr(fg2[:3], base[:3]) + (255,)
-    accent = ensure_cr(accent, base[:3])     # 金额用的就是它
+    #
+    # 参照物不能直接用 base：毛玻璃下卡片只有 a/255 是自己的底色，剩下全是
+    # 透过来的桌面。拿 base 当背景等于假设桌面是纯黑，实测浓度 90 + 取色开着
+    # 的时候，ensure_cr 算出来 6:1，屏幕上只有 1.9:1——看得见有字但读不出来。
+    # 桌面什么色量不到，就按中灰假设一次。结论是把文字推向更亮或更暗的那一端，
+    # 那一端对任意桌面都比中间调安全。
+    cr_bg = base[:3]
+    if glass:
+        _ga = base[3] / 255.0
+        cr_bg = tuple(int(c * _ga + 128 * (1 - _ga)) for c in cr_bg)
+    fg2 = ensure_cr(fg2[:3], cr_bg) + (255,)
+    accent = ensure_cr(accent, cr_bg)  # 金额用的就是它
+    # 主文字掺过主色之后同样可能掉下来，一并兜住。它是卡片上最大的一块字，
+    # 以前没走这一步纯粹是因为默认的纯白/近黑本来就达标，掺色之后不成立了。
+    fg = ensure_cr(fg_rgb, cr_bg) + (255,)
 
     im, shape = card_shape(W, H, r, base)
     probe = ImageDraw.Draw(im)
@@ -843,6 +1323,15 @@ def render(cfg, theme, clock_ms=0, rects=None):
     tx, ty, tw, th = pad, 0, W - pad * 2, H          # 文字区
     gap = int(9 * scale)                             # 图片和文字之间的小缝
 
+    # 图区的形状本来完全由图片比例决定，所以"框里"永远是填满的，空白全在
+    # 框外——框自己就比卡片矮一截 / 窄一条。之前在 place() 里怎么裁都没用，
+    # 裁的是那个已经歪掉的框。长图要真铺满，得让框先按卡片的形状来定，
+    # 再交给 place() 裁掉多出来的部分。
+    fill_band = has_img and img_opaque(path)
+
+    # 默认当成"用不上"。只有真走到裁切那一步、且没顶到上限，才会翻成可用。
+    # 无图、透明底贴纸、竖版堆叠都进不了那一步，滑块拖了都没反应。
+    _IMG_CAPPED[0] = True
     if has_img:
         room = IMG_MAX                                     # 图片最多占
         # 小图照样撑满，糊就糊。之前封在原始分辨率的 2 倍，结果一张 60px 的
@@ -852,6 +1341,26 @@ def render(cfg, theme, clock_ms=0, rects=None):
         cw = max(1, min(img_fix, int(W * room)))           # 两列：贴上下，宽受限
         ch = max(1, min(H, int(cw / max(0.05, ratio))))
         cw = max(1, min(cw, int(ch * ratio)))
+        cw_raw = cw            # 抬下限之前的宽度，判滑块可用性要用
+        if fill_band:
+            # 图占多宽本来完全由图片比例决定，越竖的图分到越少：1:2.65 的立绘
+            # 在 540 宽的卡片里只有 72 像素，一条缝，人脸都看不清。IMG_MAX 那道
+            # 上限只管横图占太多，没人管竖图占太少。给一条下限，不够就横向裁。
+            lo_pct = clamp(cfg.get("img_min", int(IMG_MIN * 100)),
+                           IMG_MIN_LO, IMG_MIN_HI, int(IMG_MIN * 100))
+            cw = max(cw, int(W * lo_pct / 100.0))
+            ch = H                                         # 高度给满，多余的裁掉
+            # 已经顶到上限的图（熊猫这类本来就够宽的），下限再怎么抬也抬不过
+            # 上限，滑块拖了没反应。记一笔，设置界面据此把它灰掉——与其解释
+            # 「这条只是下限」，不如让它在不起作用时看起来就不能用。
+            # 判据要拿滑块**能拖到的最大值**去试，不能拿当前值。
+            # 拿当前值会死锁：滑块停在 15% 时算出来还不如图片本来就有的宽，
+            # 于是判成"不起作用"灰掉；灰掉之后又没法把它拖大——因为值小所以
+            # 灰，因为灰所以改不了值。
+            _hi = max(cw_raw, int(W * IMG_MIN_HI / 100.0))
+            _hi = min(_hi, int(W * room))
+            _IMG_CAPPED[0] = (cw_raw >= int(W * room) - 1
+                              or _hi <= cw_raw + 1)
 
         # 堆叠 + 自动加高时，高度已经是照着"图片铺满整宽 + 文字够用"算出来的，
         # 「文字区最少占比」那道保险再压一次就会把图片从 300 压回 288，白白
@@ -860,6 +1369,15 @@ def render(cfg, theme, clock_ms=0, rects=None):
         sh = max(1, min(int(W / max(0.05, ratio)), int(H * room_s)))  # 堆叠：贴左右
         sw = max(1, min(W, int(sh * ratio)))
         sh = max(1, min(sh, int(sw / max(0.05, ratio))))
+        if fill_band:
+            if W - sw > max(LONG_GAP, int(LONG_GAP * scale)):
+                sw = W                                     # 实心图：宽度给满，纵向裁
+            # 堆叠布局也要一条高度下限，理由跟两列的 IMG_MIN 一样：超宽的合集图
+            # （6000x900 这种）按比例算出来只有 33 像素高，一条横缝，人脸都看不
+            # 清。而且它"没被裁"，所以连锁都不给，用户想调都没入口。
+            lo_h = int(H * IMG_MIN_H)
+            if sh < lo_h:
+                sh, sw = lo_h, W                           # 高度抬上去，横向裁
 
         # 判据就是卡片形状：你把卡片设成什么样，就用哪种排法。
         #   宽 > 高  -> 图在左、字在右，不够宽就把卡片加宽
@@ -1041,14 +1559,22 @@ def render(cfg, theme, clock_ms=0, rects=None):
             else:
                 hi3 = mid
         need_w = _need(lo3)[1]
-        if need_w <= tw + 2 and not cfg.get("_fit_pass"):
+        # 图片要铺满卡片高度得有多宽的卡片。图片带的宽度被 IMG_MAX 掐着（图最多
+        # 占卡片这么宽），宽度一被掐，高度就按比例跟着掉——横版卡片配宽图时上下
+        # 各留一条空白，就是这么来的。
+        # 加宽以前只服务文字：文字够宽就停，而那个宽度对图片可能还差几十像素。
+        # 图片能不能满高也是一条正当的加宽理由，两者取大。
+        img_need_w = 0
+        if has_img and not stack and IMG_MAX > 0:
+            img_need_w = int(img_fix / IMG_MAX) + max(0, W - bw - tw)
+        if need_w <= tw + 2 and img_need_w <= W + 2 and not cfg.get("_fit_pass"):
             _FIT_WHY[0] = ("没加宽：文字没被宽度卡住（文字列 %d，只需要 %d，"
                            "字号是被高度决定的）" % (tw, need_w))
         if os.environ.get("OFFWORK_DEBUG"):
             print("[fit] 文字列宽 tw=%d 需要 %d（高度能容下的主字号 %d）-> %s"
                   % (tw, need_w, lo3,
                      "加宽" if need_w > tw + 2 else "已经够宽，不动"))
-        if need_w > tw + 2:
+        if need_w > tw + 2 or img_need_w > W + 2:
             # 直接解出需要多宽，不要拿斜率去推。
             #   文字列 = 卡片宽 - 图片带 - 固定开销(缝隙+内边距)
             #   图片带 = min(卡片宽 x (1-文字区占比), 封顶值)
@@ -1072,6 +1598,9 @@ def render(cfg, theme, clock_ms=0, rects=None):
                     want = w_pct
                 else:
                     want = min(w_fix, w_pct)
+            # 图片那条单独算完再取大。上面那套解的是"文字列够宽"，解不出
+            # "图片能满高"，两条是独立约束，谁大听谁的。
+            want = max(want, img_need_w)
             # 上限按"用户自己设的那个宽度"算，不是按上一轮加宽后的宽度——
             # 后者是自己乘自己，几轮下来还是没有边界。
             base = clamp(cfg.get("_fit_base", cfg.get("cardw", 320)),
@@ -1148,12 +1677,34 @@ def render(cfg, theme, clock_ms=0, rects=None):
             f_mon = F_MON(f_mon.size - 1)
 
     # ---------- 画图片 ----------
+    # 把图区和"还能拖多少"记下来，交互那边靠它判断鼠标在不在图上、
+    # 一像素鼠标位移对应多少偏移量。放这儿是因为只有这里同时知道原图尺寸、
+    # 图区尺寸和当前缩放。
+    if has_img and bw > 0 and rects is not None:
+        _lg = is_long_img(bw, bh, ratio, img_opaque(path), scale,
+                       src_w / float(max(1, bw)))
+        rects.append(("_img", bx, by, bw, bh, 1 if _lg else 0))
+        if _lg:
+            _z = view_of(cfg)[0]
+            _k = max(bw / float(src_w), bh / float(src_h)) * _z
+            rects.append(("_imgext", int(src_w * _k - bw),
+                          int(src_h * _k - bh),
+                          int(zoom_cap(src_w, bw) * 100), 0, 0))
+    if has_img and bw > 0 and os.environ.get("OFFWORK_DEBUG"):
+        print("[img] 带=%dx%d 卡片=%dx%d 占比=%.1f%% 长图=%s"
+              % (bw, bh, W, H, bw * bh * 100.0 / max(1, W * H),
+                 is_long_img(bw, bh, ratio,
+                              img_opaque(path), scale,
+                       src_w / float(max(1, bw)))))
     if has_img and bw > 0:
         try:
             # 淡出朝文字那一侧：竖版图在下时往上淡，横版图在左时往右淡
             frames, durs, total = load_frames(
                 path, bw, bh, cfg, vertical=stack,
-                flip=(to_end if stack else (bx == 0)))
+                flip=(to_end if stack else (bx == 0)),
+                long_img=is_long_img(bw, bh, ratio,
+                             img_opaque(path), scale,
+                       src_w / float(max(1, bw))))
             if not frames:
                 raise ValueError("no frames")
             if len(frames) > 1 and total:            # 动图：按累计时长挑当前帧
@@ -1353,12 +1904,11 @@ def render(cfg, theme, clock_ms=0, rects=None):
             if show_money:
                 rects.append(("mon", int(blk_x), bottom - (_mb[3] - _mb[1]),
                               int(money_w(d, fm)), _mb[3] - _mb[1], fm.size))
-        if cfg.get("_hover"):
-            cx, cy = W - int(16 * scale), int(14 * scale)
-            rr2 = max(1, int(1.6 * scale))
-            for kk in (-1, 0, 1):
-                ox = cx + kk * int(6 * scale)
-                d.ellipse((ox - rr2, cy - rr2, ox + rr2, cy + rr2), fill=fg2)
+        _buttons(d, cfg, rects, W, scale,
+                 tuple(accent if tint else fg[:3]), has_img, bx, by, bw, bh,
+                 has_img and is_long_img(bw, bh, ratio,
+                              img_opaque(path), scale,
+                       src_w / float(max(1, bw))))
         return im
 
     room_r = tw if single else max(60, min(int(tw * 0.62), tw))
@@ -1614,20 +2164,23 @@ def render(cfg, theme, clock_ms=0, rects=None):
         vis = []            # (键, 对齐, 宽, 墨迹左偏, 墨迹上偏, 墨迹高, 字号)
         for k, al in plan:
             if k == "big":
-                bx, byy, _bx2, by2 = ink_box(d, big, f_big)
-                vis.append((k, al, w_big, bx, byy, by2 - byy, f_big.size))
+                # 这几行原来把变量叫 bx，跟上面图片带的 bx 重名，悄悄覆盖掉。
+                # 当时图已经画完了看不出问题，直到后来在这之后加了按钮绘制——
+                # 锁的位置拿到的是墨迹坐标，图切到右边它也不跟着走。
+                ibx, byy, _bx2, by2 = ink_box(d, big, f_big)
+                vis.append((k, al, w_big, ibx, byy, by2 - byy, f_big.size))
             elif k == "cap" and cap:
-                bx, byy, _bx2, by2 = ink_box(d, cap, f_capl)
-                vis.append((k, al, text_w(d, cap, f_capl), bx, byy,
+                ibx, byy, _bx2, by2 = ink_box(d, cap, f_capl)
+                vis.append((k, al, text_w(d, cap, f_capl), ibx, byy,
                             by2 - byy, f_capl.size))
             elif k == "mon" and show_money:
-                bx, byy, _bx2, by2 = ink_box(d, sym + money, f_mon)
-                vis.append((k, al, money_w(d, f_mon), bx, byy,
+                ibx, byy, _bx2, by2 = ink_box(d, sym + money, f_mon)
+                vis.append((k, al, money_w(d, f_mon), ibx, byy,
                             by2 - byy, f_mon.size))
             elif k == "slot" and slot_lines:
-                bx, byy, _bx2, by2 = ink_box(d, slot_lines[0], f_capr)
+                ibx, byy, _bx2, by2 = ink_box(d, slot_lines[0], f_capr)
                 hblk = (by2 - byy) + (len(slot_lines) - 1) * (f_capr.size + slot_gap)
-                vis.append((k, al, w_slot, bx, byy, hblk, f_capr.size))
+                vis.append((k, al, w_slot, ibx, byy, hblk, f_capr.size))
 
         # 行距统一：原来三个间隙分别取自三个不同字体的比例（0.34×主字、
         # 0.9×倒计时、0.42×金额），数值差好几倍，看着就是忽宽忽窄。
@@ -1833,13 +2386,11 @@ def render(cfg, theme, clock_ms=0, rects=None):
             if slot_lines:
                 rects.append(("slot", blk_x, y2, int(slot_w), slot_h, f_capr.size))
 
-    # ---- 设置入口：鼠标悬停时才浮现 ----
-    if cfg.get("_hover"):
-        cx, cy = W - int(16 * scale), int(14 * scale)
-        rr = max(1, int(1.6 * scale))
-        for k in (-1, 0, 1):
-            ox = cx + k * int(6 * scale)
-            d.ellipse((ox - rr, cy - rr, ox + rr, cy + rr), fill=fg2)
+    _buttons(d, cfg, rects, W, scale,
+             tuple(accent if tint else fg[:3]), has_img, bx, by, bw, bh,
+             has_img and is_long_img(bw, bh, ratio,
+                          img_opaque(path), scale,
+                       src_w / float(max(1, bw))))
 
     return im
 
@@ -1858,6 +2409,8 @@ WM_DESTROY, WM_LBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WM_NCLBUTTONDOWN = 2, 0x201,
 WM_LBUTTONDBLCLK = 0x203
 WM_MOUSEMOVE, WM_MOUSELEAVE = 0x200, 0x2A3
 WM_EXITSIZEMOVE = 0x232
+TIMER_ZOOM = 2      # 滚轮停手后补一次高质量重画，跟主定时器分开
+WM_RBUTTONDOWN, WM_MOUSEWHEEL = 0x204, 0x20A
 CS_DBLCLKS = 8
 TME_LEAVE = 2
 
@@ -1932,6 +2485,10 @@ _sig(user32, "CreateWindowExW", wt.HWND, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DW
 _sig(user32, "DefWindowProcW", LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
 _sig(user32, "SendMessageW", LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
 _sig(user32, "PostMessageW", wt.BOOL, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+# 不声明签名的话，ctypes 默认拿 c_int 去猜，64 位下句柄会被截断成一半，
+# 而且是静默出错——今天已经在 DefWindowProcW 上栽过一次。
+_sig(user32, "SetCapture", wt.HWND, wt.HWND)
+_sig(user32, "ScreenToClient", wt.BOOL, wt.HWND, ctypes.POINTER(wt.POINT))
 _sig(user32, "RegisterClassExW", wt.ATOM, ctypes.c_void_p)
 _sig(user32, "LoadCursorW", wt.HANDLE, wt.HINSTANCE, wt.LPCWSTR)
 _sig(user32, "ShowWindow", wt.BOOL, wt.HWND, ctypes.c_int)
@@ -1982,6 +2539,13 @@ class Widget:
         self.hwnd = None
         self.size = (0, 0)
         self.hover = False
+        self._dragging = False     # 拖动中不申请系统模糊，见 apply_blur
+        self._rects = []           # 最近一帧的文字块和按钮热区，见 hit_btn
+        self._panning = False      # 右键正在拖图取景
+        self._pan_ready = False    # 右键按在图上了，但还没动，先别当成拖动
+        self._view_dirty = False   # 取景改过但还没落盘
+        self._rdown = (0, 0)       # 右键按下的位置，用来区分点击和拖动
+        self._pan0 = (0, 0, 0.0, 0.0)
         self.interval = 0
         self.t0 = time.time()
         self.pool = image_pool()
@@ -2025,9 +2589,39 @@ class Widget:
 
     def wndproc(self, hwnd, msg, wp, lp):
         if msg == WM_TIMER:
+            if wp == TIMER_ZOOM:           # 滚轮停手后的精修，一次性
+                user32.KillTimer(hwnd, TIMER_ZOOM)
+                if self._view_dirty:       # 攒着的取景这时候才写盘
+                    self._view_dirty = False
+                    write_cfg({"img_view": self.cfg.get("img_view") or {}})
             self.paint()
             return 0
         if msg == WM_MOUSEMOVE:
+            # 平移必须在这里处理，不能另起一个 if 写在后面：这个分支是无条件
+            # return 0 的，后面同类型的分支永远走不到。今天已经栽过一次——
+            # split 分支提前 return，害得按钮在竖版上不更新。
+            if self._pan_ready or self._panning:
+                x = ctypes.c_short(lp & 0xFFFF).value
+                y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                x0, y0, _, _ = self._pan0
+                if not self._panning:
+                    if abs(x - x0) <= 4 and abs(y - y0) <= 4:
+                        return 0        # 还在抖动范围内，先当没动
+                    self._panning = True
+                area = self.img_area()
+                if area:
+                    ex, ey = area[1], area[2]
+                    x0, y0, ox0, oy0 = self._pan0
+                    # 偏移是 -1..1，按"还能拖多少像素"折算，否则同样的手速在
+                    # 大图小图上手感完全不同。除以 ex/2 是因为 -1..1 跨整个余量。
+                    z = view_of(self.cfg)[0]
+                    ox = ox0 - (2.0 * (x - x0) / ex if ex > 0 else 0)
+                    oy = oy0 - (2.0 * (y - y0) / ey if ey > 0 else 0)
+                    self.save_view(z, max(-1.0, min(1.0, ox)),
+                                   max(-1.0, min(1.0, oy)))
+                    self._view_dirty = True     # 松手再落盘
+                    self.paint()
+                return 0
             if not self.hover:
                 self.hover = True
                 tme = TRACKMOUSEEVENT(ctypes.sizeof(TRACKMOUSEEVENT),
@@ -2037,8 +2631,11 @@ class Widget:
             return 0
         if msg == WM_EXITSIZEMOVE:
             self.detect_dock()          # 松手时判断有没有靠到边缘
-            # DWM 的模糊会缓存一份采样，窗口移走后不重新取，
-            # 卡片里就显示着旧位置的内容。拖动结束重新申请一次逼它刷新。
+            # DWM 的模糊会缓存一份采样，窗口移走后不重新取，卡片里就显示着旧
+            # 位置的内容。重新申请一次逼它刷新。走 LBUTTONDOWN 那条拖动路径时
+            # 那边的 finally 已经恢复过了，这里是给别的来源（比如键盘移动、
+            # 系统对齐）兜底，_dragging 也在这儿清一次防止漏掉。
+            self._dragging = False
             self.apply_blur()
             self.paint()
             return 0
@@ -2049,18 +2646,99 @@ class Widget:
         if msg == WM_LBUTTONDOWN:
             x = ctypes.c_short(lp & 0xFFFF).value           # lParam 低位是 x，高位是 y
             y = ctypes.c_short((lp >> 16) & 0xFFFF).value
-            w, h = self.size
-            if x >= w - int(34 * self.uiscale()) and y <= int(30 * self.uiscale()):
+            hit = self.hit_btn(x, y)
+            if hit == "_btn_set":
                 open_settings(self)                          # 点右上角那三个点
                 return 0
+            if hit == "_btn_lock":
+                # 只切开关，不动图。解锁时顺手放大之类的"贴心"处理都别做——
+                # 用户点锁是为了开始调整，不是为了让画面先自己变一下。
+                lk = not bool(self.cfg.get("img_lock", True))
+                self.cfg["img_lock"] = lk
+                write_cfg({"img_lock": lk})
+                self.paint()
+                return 0
             user32.ReleaseCapture()                          # 其余位置拖动窗口
-            user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
-            # SendMessageW 会一直阻塞到拖动结束，所以这里已经是松手之后了。
-            # 先吸附再存位置，否则存下来的是吸附前那个坐标。
+            # 拖动期间关掉系统模糊，理由见 apply_blur。这里的进入/退出时机是
+            # 准的：SendMessageW 会一直阻塞到拖动结束，不用像 Tk 那些例子那样
+            # 靠 <Configure> 加定时器去猜什么时候算"停手了"。
+            self._dragging = True
+            self.apply_blur()
+            try:
+                user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+            finally:
+                self._dragging = False
+                self.apply_blur()                            # 松手后恢复
+            # 这里已经是松手之后了。先吸附再存位置，否则存下来的是吸附前那个坐标。
             self.detect_dock()
             self.save_pos()
             return 0
+        if msg == WM_RBUTTONDOWN:
+            x = ctypes.c_short(lp & 0xFFFF).value
+            y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+            self._rdown = (x, y)
+            self._panning = False
+            self._pan_ready = False
+            area = self.img_area()
+            if area and not self.cfg.get("img_lock", True):
+                bx, by, bw, bh = area[0]
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    # 只是"准备好可以平移"，还不算正在平移。真正开始要等鼠标
+                    # 动起来——按下就置真的话，原地点一下松手会被当成拖动，
+                    # 设置就再也打不开了。
+                    self._pan_ready = True
+                    self._pan0 = (x, y) + view_of(self.cfg)[1:]
+                    user32.SetCapture(hwnd)
+            return 0
+        if msg == WM_MOUSEWHEEL:
+            area = self.img_area()
+            if area and not self.cfg.get("img_lock", True):
+                pt = wt.POINT(ctypes.c_short(lp & 0xFFFF).value,
+                              ctypes.c_short((lp >> 16) & 0xFFFF).value)
+                user32.ScreenToClient(hwnd, ctypes.byref(pt))  # 滚轮给的是屏幕坐标
+                bx, by, bw, bh = area[0]
+                if bx <= pt.x <= bx + bw and by <= pt.y <= by + bh:
+                    step = ctypes.c_short((wp >> 16) & 0xFFFF).value / 120.0
+                    z, ox, oy = view_of(self.cfg)
+                    # 上限由这张图自己的分辨率定：放到原图 1:1 就够了，再放
+                    # 只是把像素拉大。一律给固定倍数的话，小图会被拉糊，
+                    # 大图又放不开——这张 11537 宽的图缩了 52 倍，6 倍根本不够。
+                    cap = area[3] if len(area) > 3 else 6.0
+                    self.save_view(max(1.0, min(cap, z * (1.1 ** step))), ox, oy)
+                    # 把排队的滚轮消息一次吃掉。滚轮来得比重画快，不合并的话
+                    # 每一格都要画一帧，画面永远落在手后面几格。
+                    m = wt.MSG()
+                    while user32.PeekMessageW(ctypes.byref(m), hwnd,
+                                              WM_MOUSEWHEEL, WM_MOUSEWHEEL, 1):
+                        st2 = ctypes.c_short((m.wParam >> 16) & 0xFFFF).value / 120.0
+                        z2 = view_of(self.cfg)[0]
+                        self.save_view(max(1.0, min(cap, z2 * (1.1 ** st2))), ox, oy)
+                    # 连着滚的时候用快速插值，停手再换高质量，见 place。
+                    # 停手之后必须主动安排一次重画。_zoom_until 到期只是让
+                    # "下一次 paint" 用高质量，可静态图不走动画定时器，
+                    # 秒数又要等到下一秒才变——中间没人触发重画，草稿就一直
+                    # 留在屏幕上，看着就是"放大之后一直是糊的"。
+                    self._view_dirty = True     # 停手后再落盘，见 TIMER_ZOOM
+                    user32.SetTimer(hwnd, TIMER_ZOOM, 260, None)
+                    self.paint()
+                    return 0
+            return 0
         if msg == WM_RBUTTONUP or msg == WM_LBUTTONDBLCLK:
+            if self._pan_ready or self._panning:
+                user32.ReleaseCapture()
+                was_pan = self._panning
+                self._pan_ready = self._panning = False
+                if was_pan:
+                    if self._view_dirty:        # 拖动全程只改内存，松手才落盘
+                        self._view_dirty = False
+                        write_cfg({"img_view": self.cfg.get("img_view") or {}})
+                    return 0            # 刚才是拖图，不是点击
+            if msg == WM_RBUTTONUP:
+                x = ctypes.c_short(lp & 0xFFFF).value
+                y = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                x0, y0 = self._rdown
+                if abs(x - x0) > 4 or abs(y - y0) > 4:
+                    return 0            # 在图外拖的，也不算点击
             open_settings(self)
             return 0
         if msg == WM_DESTROY:
@@ -2071,15 +2749,27 @@ class Widget:
     # ---------- 绘制 ----------
     def paint(self):
         self.maybe_rotate()
-        if self.cfg.get("bg") == "glass":
-            now = int(time.time())
-            if now != getattr(self, "_blur_tick", 0):
-                self._blur_tick = now      # 每秒补刷一次采样
-                self.apply_blur()
+        # 这里原来每秒补刷一次模糊采样。去掉了：每次重新申请，DWM 都要丢弃并
+        # 重建一遍采样，Win10 上重建得快看不出来，Win11 上慢一拍就是一次闪。
+        # 一秒一次等于一秒闪一次，而窗口不动的时候采样根本不需要重建。
+        # 真正需要重新申请的只有两处：拖动结束、以及配置变更后的 apply。
         cfg = dict(self.cfg)
         cfg["_hover"] = self.hover
-        im = render(cfg, self.theme, int((time.time() - self.t0) * 1000))
+        # 试过拖动时把 glass 顶到 255 变成不透明，看着更"干净"，但卡片会突然
+        # 变一副面孔，比透出点东西难看得多。拖动只关模糊，透明度一律照旧。
+        # 收下 rects：里面带着两个按钮的热区，命中判断要用，见 hit_btn。
+        rects = []
+        im = render(cfg, self.theme, int((time.time() - self.t0) * 1000), rects)
+        self._rects = rects
         w, h = im.size
+
+        # 尺寸变了要先把裁剪区换成新的，再往上画。
+        # 原来是画完才调 clip_region：UpdateLayeredWindow 会按 size 参数直接
+        # 把窗口撑到新尺寸，可 SetWindowRgn 的圆角区域还是按旧尺寸算的——
+        # 新旧之间那一条既没被裁掉、也不在旧区域里，显示出来就是一块黑。
+        # 横竖切换时尺寸变化最大，所以那块黑最明显。
+        if self.size != (w, h) and self.cfg.get("bg") == "glass":
+            self.clip_region(True, (w, h))
 
         # UpdateLayeredWindow 要预乘 alpha 的 BGRA
         r, g, b, a = im.split()
@@ -2116,8 +2806,6 @@ class Widget:
         self.size = (w, h)
         if changed:                  # 尺寸没变就别动窗口，否则拖动时会被拽回去
             self.nudge_onscreen()
-            if self.cfg.get("bg") == "glass":
-                self.clip_region(True)
 
     def apply_alttab(self):
         """WS_EX_TOOLWINDOW 会让窗口从 Alt+Tab 里消失，这是小组件的常规做法，
@@ -2150,27 +2838,89 @@ class Widget:
     def uiscale(self):
         return max(0.75, min(1.5, float(self.cfg.get("ui", 100)) / 100))
 
+    def img_area(self):
+        """(图区矩形, 横向还能拖多少, 纵向还能拖多少)。没有可编辑的图就返回 None。"""
+        box = ext = None
+        for k, a, b, c, dd, f in (self._rects or []):
+            if k == "_img" and f:
+                box = (a, b, c, dd)
+            elif k == "_imgext":
+                ext = (a, b, c / 100.0)
+        return (box, ext[0], ext[1], ext[2]) if box and ext else None
+
+    def save_view(self, zoom, ox, oy, to_disk=False):
+        """取景按文件名存。批量导入几十张再开轮换，存一份全局值的话
+        换张图取景就全乱了。
+
+        默认只改内存。write_cfg 里有 os.fsync 强制刷盘，滚轮一秒十几格、
+        拖动一秒几十次，每次都同步等硬盘确认——机械盘或者被杀软盯着的目录
+        上就是几十毫秒一次，手感直接废掉。取景是个瞬时状态，松手再落盘就行。
+        """
+        f = self.cfg.get("img_file") or ""
+        if not f:
+            return
+        v = dict(self.cfg.get("img_view") or {})
+        v[f] = [round(zoom, 3), round(ox, 4), round(oy, 4)]
+        self.cfg["img_view"] = v
+        if to_disk:
+            write_cfg({"img_view": v})
+
+    def hit_btn(self, x, y):
+        """按 render 记下的热区判断点到了哪个按钮。
+
+        热区以前是在这里写死的（x >= W-34 且 y <= 30），跟绘制那边各算各的。
+        锁的位置跟着图区走，图片切到右边或下边就完全对不上，所以改成让
+        render 把热区一起记进 rects，两边共用同一份坐标。
+        """
+        for k, rx, ry, rw, rh, _ in (self._rects or []):
+            if k.startswith("_btn_") and rx <= x <= rx + rw and ry <= y <= ry + rh:
+                return k
+        return None
+
     def apply_blur(self):
-        """毛玻璃模式才开系统模糊；纯色模式靠逐像素 alpha，圆角完全抗锯齿"""
-        glass = self.cfg.get("bg") == "glass"
-        policy = ACCENTPOLICY(3 if glass else 0, 2, 0, 0)   # 3 = BLURBEHIND
+        """毛玻璃模式才开系统模糊；纯色模式靠逐像素 alpha，圆角完全抗锯齿。
+
+        拖动过程中一律不开。SetWindowCompositionAttribute 是未文档化的 API，
+        Win10 1903 之后拖窗口时模糊跟不上鼠标，Win11 22621 之后更明显——
+        画面一顿一顿的，边上还闪。这个坑 WPF（FluentWPF #42）和 Qt（qtacrylic）
+        社区踩出来的共识都是同一个：拖的时候干脆把它关掉，松手再开回来。
+        拖动中窗口本来就在动，那一两百毫秒没有模糊几乎看不出来。
+        """
+        glass = self.cfg.get("bg") == "glass" and not self._dragging
+        if not glass:
+            state, tint = 0, 0
+        elif _win_build() >= 22000:
+            dark = self.theme["dark"] if self.cfg["bg"] in ("auto", "glass") \
+                else (self.cfg["bg"] == "dark")
+            r, g, b = (26, 26, 26) if dark else (242, 242, 242)
+            tint = (0x01 << 24) | (b << 16) | (g << 8) | r
+            state = 4
+        else:
+            state, tint = 3, 0
+        policy = ACCENTPOLICY(state, 2, tint, 0)
         data = WINCOMPATTRDATA(19, ctypes.pointer(policy), ctypes.sizeof(policy))
         try:
             user32.SetWindowCompositionAttribute(
                 self.hwnd, ctypes.cast(ctypes.byref(data), ctypes.c_void_p))
         except Exception:
             pass
-        self.clip_region(glass)
+        # 裁剪跟的是配置，不是"此刻有没有开模糊"。拖动时模糊是关的，但窗口
+        # 已经被拉成不透明，没有裁就会露出四个直角。
+        self.clip_region(self.cfg.get("bg") == "glass")
 
-    def clip_region(self, glass):
+    def clip_region(self, glass, size=None):
         """DWM 的模糊作用于整个矩形窗口，不看我们位图的 alpha。
         卡片是圆角的，四角外面那圈会露出一个矩形的模糊区域。
         只能再用 SetWindowRgn 把窗口本身裁成圆角，代价是硬边裁剪有锯齿。
-        纯色模式不申请模糊，就不需要裁，圆角保持抗锯齿。"""
+        纯色模式不申请模糊，就不需要裁，圆角保持抗锯齿。
+
+        size 用来在窗口真正变大之前就按新尺寸裁。self.size 是"上一帧画的
+        尺寸"，横竖切换那一帧它还是旧值，拿它裁会短一截。
+        """
         if not glass:
             user32.SetWindowRgn(self.hwnd, None, True)
             return
-        w, h = self.size
+        w, h = size or self.size
         if w <= 0 or h <= 0:
             return
         d = max(2, int(RADIUS * 2 * self.uiscale()))
@@ -2275,7 +3025,13 @@ class Widget:
         wa = self.work_area()
         w, h = self.size
         pad = int(self.cfg.get("dock_pad", 12))
-        dx, dy = self.cfg.get("dock_x", ""), self.cfg.get("dock_y", "")
+        # 关掉吸附后就别再按记着的边贴回去了。以前只有 detect_dock 看这个开关，
+        # 这里没看——用户关掉开关，卡片不再"吸"过去了，可换图一改尺寸还是会
+        # 自己弹回边上，看起来像开关没生效。
+        if self.cfg.get("dock", True):
+            dx, dy = self.cfg.get("dock_x", ""), self.cfg.get("dock_y", "")
+        else:
+            dx = dy = ""
         nx, ny = r.left, r.top
         if dx == "left":
             nx = wa.left + pad
@@ -2360,10 +3116,13 @@ def suggest_size(wa, ui=100, portrait=False):
 
 
 TAB_KEYS = {
-    "工作": ["start", "end", "salary", "cur_sym", "sym_gap", "work_text", "show_money", "show_cap"],
+    "工作": ["start", "end", "salary", "cur_sym", "sym_gap", "work_text",
+             "rest_text", "workdays", "lunch", "lunch_start", "lunch_end",
+             "lunch_text",
+             "show_money", "show_cap", "show_sec"],
     "外观": ["bg", "ui", "cardw", "cardh", "glass", "top", "alttab",
              "dock", "dock_pad", "tint", "tint_amt"],
-    "图片": ["img_side", "fade", "rotate_min", "shuffle"],
+    "图片": ["img_side", "img_fill", "img_min", "fade", "rotate_min", "shuffle"],
     "倒计时": ["slots", "slot_rows", "slot_each"],
 }
 
@@ -2525,7 +3284,7 @@ def _build(widget):
             commit()
         v.trace_add("write", on)
         VARS[key] = lambda val, v=v: v.set(float(val))
-        return v
+        return v, sc, out
 
     def add_check(parent, r, label, key, default, cb=None):
         v = tk.BooleanVar(value=bool(cfg.get(key, default)))
@@ -2539,9 +3298,65 @@ def _build(widget):
     # ================= 工作 =================
     t1 = ttk.Frame(nb, padding=12)
     nb.add(t1, text="工作")
-    add_entry(t1, 0, "上班时间", "start", maxlen=5)
-    add_entry(t1, 1, "下班时间", "end", maxlen=5)
-    add_entry(t1, 2, "月薪", "salary", cast=float, maxlen=9)
+    ttk.Label(t1, text="每周上班").grid(row=0, column=0, sticky="w", pady=4)
+    wd_box = ttk.Frame(t1)
+    wd_box.grid(row=0, column=1, columnspan=2, sticky="w", pady=4)
+    wd_vars = {}
+
+    def on_workdays():
+        picked = sorted(k for k, v in wd_vars.items() if v.get())
+        if not picked:                      # 一天不选会除零，挡回去
+            wd_vars[1].set(True)
+            picked = [1]
+        write_cfg({"workdays": picked})
+        widget.reload()
+        md.config(text="月计薪 %.2f 天" % month_days({"workdays": picked}))
+
+    _cur_wd = set(workdays_of(cfg))
+    for i, nm in enumerate("一二三四五六日"):
+        v = tk.BooleanVar(value=(i + 1) in _cur_wd)
+        wd_vars[i + 1] = v
+        ttk.Checkbutton(wd_box, text=nm, variable=v, width=3,
+                        command=on_workdays).grid(row=0, column=i, padx=(0, 2))
+    md = ttk.Label(t1, text="月计薪 %.2f 天" % month_days(cfg), foreground="#888")
+    md.grid(row=1, column=1, columnspan=2, sticky="w")
+    VARS["workdays"] = lambda val: [v.set((k) in set(int(x) for x in val))
+                                    for k, v in wd_vars.items()]
+
+    add_entry(t1, 2, "上班时间", "start", maxlen=5)
+    add_entry(t1, 3, "下班时间", "end", maxlen=5)
+    lun_v = tk.BooleanVar(value=bool(cfg.get("lunch")))
+    VARS["lunch"] = lambda val, v=lun_v: v.set(bool(val))
+    lun_box = ttk.Frame(t1)
+    lun_box.grid(row=4, column=0, columnspan=3, sticky="we", pady=4)
+    lun_e = []
+
+    def refresh_lunch():
+        """没勾午休就把两个时间框灰掉——填了也不生效，让它看起来就不能填。"""
+        st = "normal" if lun_v.get() else "disabled"
+        for e in lun_e:
+            e.config(state=st)
+
+    def on_lunch():
+        write_cfg({"lunch": lun_v.get()})
+        widget.reload()
+        refresh_lunch()
+
+    ttk.Checkbutton(lun_box, text="午休", variable=lun_v,
+                    command=on_lunch).grid(row=0, column=0, sticky="w")
+    for _i, _k in enumerate(("lunch_start", "lunch_end")):
+        _var = tk.StringVar(value=str(cfg.get(_k, "")))
+        VARS[_k] = lambda val, v=_var: v.set(str(val))
+        _e = ttk.Entry(lun_box, textvariable=_var, width=7)
+        _e.grid(row=0, column=1 + _i * 2, padx=(8 if _i == 0 else 4, 2))
+        if _i == 0:
+            ttk.Label(lun_box, text="—").grid(row=0, column=2)
+        _var.trace_add("write", lambda *_a, k=_k, v=_var: (
+            write_cfg({k: v.get()[:5]}), widget.reload()))
+        lun_e.append(_e)
+    refresh_lunch()
+
+    add_entry(t1, 5, "月薪", "salary", cast=float, maxlen=9)
     # 只放 BMP 内的符号。emoji 在 BMP 以外，Tcl/Tk 8.6 存不住也画不出，
     # 别再往这个列表里加。这个下拉框是可编辑的，列表里没有的自己敲。
     CUR = {"¥ 人民币 / 日元": "¥", "$ 美元": "$", "€ 欧元": "€", "£ 英镑": "£",
@@ -2551,11 +3366,11 @@ def _build(widget):
            "₹ 印度卢比": "₹", "₽ 卢布": "₽", "A$ 澳元": "A$", "C$ 加元": "C$",
            "CHF 瑞士法郎": "CHF", "¢ 分": "¢", "元": "元", "不显示符号": ""}
     crev = {v: k for k, v in CUR.items()}
-    ttk.Label(t1, text="货币符号").grid(row=3, column=0, sticky="w", pady=4)
+    ttk.Label(t1, text="货币符号").grid(row=6, column=0, sticky="w", pady=4)
     curv = tk.StringVar(value=crev.get(cfg.get("cur_sym", "¥"),
                                        str(cfg.get("cur_sym", "¥"))))
     ttk.Combobox(t1, textvariable=curv, width=18,
-                 values=list(CUR.keys())).grid(row=3, column=1, columnspan=2,
+                 values=list(CUR.keys())).grid(row=6, column=1, columnspan=2,
                                                sticky="we", pady=4)
     VARS["cur_sym"] = lambda val, v=curv, rv=crev: v.set(rv.get(val, str(val)))
 
@@ -2567,8 +3382,11 @@ def _build(widget):
         commit(500)
     curv.trace_add("write", on_cur)
 
-    add_check(t1, 4, "符号与数字之间空一格", "sym_gap", False)
-    add_entry(t1, 5, "上班文案", "work_text", maxlen=12)
+    add_check(t1, 7, "符号与数字之间空一格", "sym_gap", False)
+    add_entry(t1, 8, "上班文案", "work_text", maxlen=12)
+    add_entry(t1, 9, "休息文案", "rest_text", maxlen=12)
+    add_entry(t1, 10, "午休文案", "lunch_text", maxlen=12)
+
     def on_show(key, var, row):
         write_cfg({key: var.get()})
         widget.reload()
@@ -2577,15 +3395,21 @@ def _build(widget):
     VARS["show_money"] = lambda val, v=money_v: v.set(bool(val))
     ttk.Checkbutton(t1, text="显示今日收入", variable=money_v,
                     command=lambda: on_show("show_money", money_v, "mon")
-                    ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+                    ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(6, 0))
     cap_v = tk.BooleanVar(value=bool(cfg.get("show_cap", True)))
     VARS["show_cap"] = lambda val, v=cap_v: v.set(bool(val))
     ttk.Checkbutton(t1, text="显示说明行（距下班 · 18:30）", variable=cap_v,
                     command=lambda: on_show("show_cap", cap_v, "cap")
-                    ).grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+                    ).grid(row=12, column=0, columnspan=3, sticky="w", pady=3)
+    sec_v = tk.BooleanVar(value=bool(cfg.get("show_sec", True)))
+    VARS["show_sec"] = lambda val, v=sec_v: v.set(bool(val))
+    ttk.Checkbutton(t1, text="显示秒（关掉后主时间会自动变大一点）", variable=sec_v,
+                    command=lambda: on_show("show_sec", sec_v, "sec")
+                    ).grid(row=13, column=0, columnspan=3, sticky="w", pady=3)
     ttk.Label(t1, text="货币符号可以直接在框里改，最多 4 个字符；汉字量词会自动放到\n"
-                       "数字后面（288.91 元）。上班文案留空用「距下班」",
-              foreground="#888", justify="left").grid(row=8, column=0, columnspan=3,
+                       "数字后面（288.91 元）。文案留空分别用「距下班」和「休息日」\n"
+                       "调休、法定假期请用「倒计时」页自己加一条",
+              foreground="#888", justify="left").grid(row=14, column=0, columnspan=3,
                                                       sticky="w")
 
     # ================= 外观 =================
@@ -2647,7 +3471,7 @@ def _build(widget):
                command=lambda: use_suggested(False)).grid(row=0, column=1, padx=(0, 4))
     ttk.Button(szbar, text="竖版", width=8,
                command=lambda: use_suggested(True)).grid(row=0, column=2)
-    gl = add_scale(t2, 6, "玻璃浓度", "glass", 1, 255, 90)
+    gl, _gl_sc, _gl_out = add_scale(t2, 6, "玻璃浓度", "glass", 1, 255, 90)
     # 这三个控件的引用要在这里就抓住。grid_remove() 之后控件不再受 grid 管理，
     # grid_slaves(row=5) 会返回空列表 —— 藏起来就再也找不回来了，
     # 表现就是切回毛玻璃时滑块不出现，得重开设置窗口。
@@ -2673,12 +3497,19 @@ def _build(widget):
                     command=lambda: set_autostart(auto_v.get())
                     ).grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
 
+    def on_dock(v):
+        # 关掉时把记着的边一起清掉，否则重新打开会突然弹回上次那条边
+        patch = {"dock": v}
+        if not v:
+            patch["dock_x"] = patch["dock_y"] = ""
+        write_cfg(patch)
+        widget.reload()
+
     dock_v = tk.BooleanVar(value=bool(cfg.get("dock", True)))
     VARS["dock"] = lambda val, v=dock_v: v.set(bool(val))
-    ttk.Checkbutton(t2, text="拖到屏幕边缘时自动吸附（换图变尺寸后重新贴边）",
+    ttk.Checkbutton(t2, text="拖到屏幕边缘时自动吸过去（关掉后卡片停在你松手的位置）",
                     variable=dock_v,
-                    command=lambda: (write_cfg({"dock": dock_v.get()}),
-                                     widget.reload())
+                    command=lambda: on_dock(dock_v.get())
                     ).grid(row=11, column=0, columnspan=3, sticky="w", pady=3)
     add_scale(t2, 12, "贴边留白", "dock_pad", 0, 40, 12)
 
@@ -2815,13 +3646,28 @@ def _build(widget):
     VARS["img_side"] = _set_side
     refresh_side()
 
+    FILL = {"自动（照片填满 · 贴纸完整）": "auto",
+            "适应（完整显示，可能留边）": "contain",
+            "填满（裁掉多余，不留边）": "cover"}
+    frev = {v: k for k, v in FILL.items()}
+    ttk.Label(t3, text="填充").grid(row=2, column=0, sticky="w", pady=4)
+    fillv = tk.StringVar(value=frev.get(str(cfg.get("img_fill", "auto")),
+                                        list(FILL.keys())[0]))
+    ttk.Combobox(t3, textvariable=fillv, width=22, state="readonly",
+                 values=list(FILL.keys())).grid(row=2, column=1, columnspan=2,
+                                                sticky="we", pady=4)
+    VARS["img_fill"] = lambda val, v=fillv, rv=frev: v.set(
+        rv.get(str(val), list(rv.values())[0]))
+    fillv.trace_add("write", lambda *_: (write_cfg({"img_fill": FILL[fillv.get()]}),
+                                         widget.reload()))
+
     ROT = {"不轮换": 0, "每分钟": 1, "每 5 分钟": 5, "每 15 分钟": 15,
            "每小时": 60, "每 6 小时": 360, "每天": 1440}
     rrev = {v: k for k, v in ROT.items()}
-    ttk.Label(t3, text="轮换").grid(row=2, column=0, sticky="w", pady=4)
+    ttk.Label(t3, text="轮换").grid(row=3, column=0, sticky="w", pady=4)
     rotv = tk.StringVar(value=rrev.get(int(cfg.get("rotate_min", 0)), "不轮换"))
     ttk.Combobox(t3, textvariable=rotv, width=14, state="readonly",
-                 values=list(ROT.keys())).grid(row=2, column=1, columnspan=2,
+                 values=list(ROT.keys())).grid(row=3, column=1, columnspan=2,
                                                sticky="we", pady=4)
     VARS["rotate_min"] = lambda val, v=rotv, rv=rrev: v.set(rv.get(val, list(rv.values())[0]))
     rotv.trace_add("write", lambda *_: (write_cfg({"rotate_min": ROT[rotv.get()]}),
@@ -2831,13 +3677,33 @@ def _build(widget):
     ttk.Checkbutton(t3, text="随机顺序（取消则按文件名依次播放）", variable=shufv,
                     command=lambda: (write_cfg({"shuffle": shufv.get()}),
                                      widget.reload())
-                    ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
+                    ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
-    add_scale(t3, 4, "淡出", "fade", 0, 100, 22)
-    ttk.Label(t3, text="图片按自己的宽高比完整显示，绝不裁切。排法由卡片形状决定：\n"
-                       "宽 > 高 时图在左、字在右；高 ≥ 宽 时图在上、字在下。\n"
-                       "图片没占满的那一维会居中。",
-              foreground="#888", justify="left").grid(row=6, column=0, columnspan=3,
+    _, imin_sc, imin_out = add_scale(t3, 5, "图片占宽", "img_min",
+                                     IMG_MIN_LO, IMG_MIN_HI, int(IMG_MIN * 100))
+    imin_lbl = t3.grid_slaves(row=5, column=0)[0]
+
+    def refresh_imin():
+        """竖版（图在上下）不读这个值，堆叠布局里图片本来就占满整宽。
+        代码上它一直只在两列分支起作用，但界面照样让人拖，拖了没反应——
+        看着像坏了。跟「图片位置」的措辞一样，跟着排法灰掉。"""
+        # 两种情况下它都不起作用：竖版堆叠布局根本不读这个值；横版下图片
+        # 已经顶到 IMG_MAX 上限时，下限抬不过上限。轮换开着的话每张图的
+        # 结论还不一样，所以跟着轮询刷，不能只在打开设置时判一次。
+        on = "disabled" if (_STACK[0] or _IMG_CAPPED[0]) else "normal"
+        if str(imin_sc["state"]) != on:
+            imin_sc.config(state=on)
+            imin_lbl.config(foreground="" if on == "normal" else "#aaa")
+            imin_out.config(foreground="" if on == "normal" else "#aaa")
+    refresh_imin()
+    add_scale(t3, 6, "淡出", "fade", 0, 100, 22)
+    ttk.Label(t3, text="排法由卡片形状决定：宽 > 高 时图在左、字在右；\n"
+                       "高 ≥ 宽 时图在上、字在下。\n"
+                       "「图片占宽」只在图在左右时起作用，管的是细长竖图不要\n"
+                       "被压成一条缝；横图本来就够宽，调它没有变化。\n"
+                       "照片会裁掉多余铺满，抠好的贴纸保持完整。被裁的图\n"
+                       "左上角会出现锁，解开就能拖动挑要显示哪一段。",
+              foreground="#888", justify="left").grid(row=7, column=0, columnspan=3,
                                                       sticky="w", pady=(6, 0))
     refresh_img_label()
 
@@ -2895,7 +3761,7 @@ def _build(widget):
                         v = str(WEEK.index(v)) if v in WEEK else "5"
                     elif s[idx]["type"] == "monthly":
                         try:
-                            v = str(max(1, min(28, int(v))))
+                            v = str(max(1, min(31, int(v))))
                         except ValueError:
                             return
                     s[idx]["value"] = v
@@ -3000,6 +3866,7 @@ def _build(widget):
         try:
             size_lbl.config(text=size_hint())
             refresh_side()        # 排法变了，「图片位置」的措辞要跟着换
+            refresh_imin()        # 竖版下「图片占宽」不起作用，灰掉
         except Exception:
             pass
         try:
@@ -3077,12 +3944,22 @@ def build_tray(widget):
     icon.run()
 
 
+_INSTANCE_SOCK = []        # 独占的端口，要一直持有；被回收掉锁就没了
+
+
 def single_instance():
+    """占住一个本地端口当单实例锁。
+
+    以前是 globals()["_lock"] = s——一个模块级的赋值，运行时凭空创建全局名。
+    静态看不出任何冲突，可它会把同名的东西悄悄换掉：画锁图标的 _lock 函数
+    就是这么被替换成 socket 的，调用时报「socket object is not callable」，
+    而且只在打包跑起来之后才炸。改成显式的列表，名字也不再含糊。
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", 51721))
         s.listen(1)
-        globals()["_lock"] = s
+        _INSTANCE_SOCK.append(s)
         return True
     except OSError:
         return False
